@@ -1,166 +1,209 @@
-# CLAUDE.md — TempDRL for ERCOT RTC+B
-**Date:** March 20, 2026
+# CLAUDE.md — TempDRL for ERCOT RTC+B (Revised)
+**Date:** March 24, 2026
 **Project:** Temporal-Aware Deep Reinforcement Learning for Battery Storage Bidding in ERCOT's Post-RTC+B Market
-**Status:** Week 1 scaffold built → Begin data exploration and iterative implementation
+**Status:** Pipeline validated, data backfill in progress → Begin TTFE + SAC implementation
 
 ---
 
 ## CRITICAL INSTRUCTIONS FOR CLAUDE CODE
 
-1. **Work incrementally.** Do NOT attempt to build the full system at once. Explore data first, report findings, wait for confirmation, then proceed to the next step.
-2. **Data governs strategy.** Every design decision (column mappings, feature engineering, action space dimensions) should be informed by what we actually find in the data, not assumptions.
-3. **Ask before building.** When encountering ambiguity (e.g., unexpected column names, missing data products, API failures), stop and report rather than guessing.
-4. **The old `HybridBid_Project_Handoff_v2.md` is OBSOLETE.** It describes a 3-tier hybrid architecture (forecasting ensemble + DreamerV3 + LLM context module + meta-controller) that has been dropped. Ignore it entirely. This CLAUDE.md is the single source of truth.
+1. **Work incrementally.** Do NOT attempt to build the full system at once. Build one module, test it, confirm, then proceed.
+2. **Two-stage training is the core architectural decision.** Do not mix pre-RTC+B and post-RTC+B data in training. Stage 1 uses pre-RTC+B only, Stage 2 uses post-RTC+B only.
+3. **Ask before building.** When encountering ambiguity, stop and report rather than guessing.
+4. **The old `HybridBid_Project_Handoff_v2.md` is OBSOLETE.** This CLAUDE.md is the single source of truth.
+5. **Era-aware features (is_post_rtcb, days_since_rtcb, rt_as_available) are REMOVED from the observation space.** The structural break is handled by the two-stage training schedule, not observation flags.
 
 ---
 
 ## WHAT WE'RE BUILDING
 
-We are implementing the approach from this paper for the ERCOT market:
+Adapting the TempDRL approach from Li et al. (2024) for ERCOT's post-RTC+B market, with a **two-stage pretrain → finetune** training strategy to handle the RTC+B structural break.
 
 > **Li, J., Wang, C., Zhang, Y., & Wang, H.** "Temporal-Aware Deep Reinforcement Learning for Energy Storage Bidding in Energy and Contingency Reserve Markets." *IEEE Transactions on Energy Markets, Policy and Regulation*, Sept 2024. (arXiv:2402.19110)
 
-The paper uses a **Soft Actor-Critic (SAC)** algorithm paired with a **Transformer-based Temporal Feature Extractor (TTFE)** for battery storage bidding in Australia's National Electricity Market (NEM), jointly optimizing energy and contingency reserve (FCAS) markets.
-
-We are adapting this to **ERCOT's post-RTC+B market** (live since December 5, 2025), where energy and 5 ancillary service products are now co-optimized every 5 minutes in SCED.
-
-**Target users:** Small battery storage operators (5-20 MW) who currently achieve ~56% of optimal revenue using simple time-based strategies.
-
-**Primary deliverable:** A working system with initial results within 6-8 weeks. Publication is a secondary objective.
+**Target users:** Small battery storage operators (5-20 MW) in ERCOT.
+**Primary deliverable:** A working system with initial results within 6-8 weeks.
 
 ---
 
-## WHY ERCOT POST-RTC+B
+## WHY TWO-STAGE TRAINING (NOT ERA-AWARE FEATURES)
 
-ERCOT was the last major US ISO to implement real-time co-optimization of energy and ancillary services. The RTC+B redesign (December 5, 2025) introduced:
+### The Problem
+- Post-RTC+B data: ~30,000 five-minute intervals (~3.5 months). Insufficient for SAC convergence alone.
+- Pre-RTC+B data: ~525,000 intervals (2020–2025). Abundant but from a fundamentally different MDP (no real-time AS market).
+- Mixing both with era flags creates problems: non-stationary MDP, 95/5 sample ratio imbalance, Q-function must represent two different value landscapes in shared weights.
 
-- **Real-time co-optimization:** Energy and AS are simultaneously dispatched in SCED every 5 minutes (previously AS was procured only in the Day-Ahead Market).
-- **Single-model ESR:** Batteries are now a single unified resource with a continuous operating range from max charge (negative MW) to max discharge (positive MW). Replaces the old "combo model" with separate generator and load resources.
-- **ISO-managed SoC:** ERCOT's SCED engine directly considers telemetered State of Charge every 5 minutes to ensure dispatch feasibility. Unique among US ISOs.
-- **Ancillary Service Demand Curves (ASDCs):** Replace the former Operating Reserve Demand Curve (ORDC). Scarcity is now priced inside the dispatch optimization, affecting both LMPs and MCPCs simultaneously.
-- **5 AS products co-optimized:** Regulation Up, Regulation Down, Responsive Reserve (RRS), ERCOT Contingency Reserve Service (ECRS), Non-Spinning Reserve.
-- **10-point monotonic Energy Bid/Offer Curve (EB/OC):** Required bidding format. Deferred for initial implementation — we use scalar actions first.
-- **Set Point Deviation (SPD) compliance:** Replaces Base Point Deviation. Tolerance: max(3% of average set point, 3 MW). Penalties for deviation.
+### The Solution: Pretrain → Finetune
+- **Stage 1 (Pre-RTC+B, energy-only):** Train the TTFE + 1D energy actor + twin critics on 525k transitions. The agent learns temporal price patterns, SoC management, load/solar cycle awareness. These are transferable skills.
+- **Stage 2 (Post-RTC+B, co-optimize):** Initialize TTFE from Stage 1. Replace actor with 6D head (energy dim from Stage 1, AS dims near-zero). Fresh twin critics. Finetune on 30k post-RTC+B transitions with a progressive unfreezing schedule.
 
-**The structural similarity to Australia's NEM** (where TempDRL was validated) makes this adaptation feasible: both markets co-optimize energy and reserves at 5-minute intervals with battery participation. Key differences: ERCOT uses nodal pricing (NEM uses regional), ERCOT has ASDCs (NEM uses different scarcity mechanisms), and ERCOT has stricter SPD compliance requirements.
+This preserves the Li et al. architecture while respecting the structural break through the training schedule rather than observation engineering.
 
 ---
 
 ## DATA STRATEGY
 
-### The Data Constraint
-- **Post-RTC+B data:** Dec 5, 2025 → present ≈ ~3.5 months ≈ ~30,000 five-minute intervals.
-- **Pre-RTC+B data:** 2020 → Dec 4, 2025 ≈ ~5 years ≈ ~525,000 intervals per product.
-- **SAC is model-free** and typically needs 100k-500k transitions to converge. Post-RTC+B data alone is insufficient.
+### Data Access (Confirmed via Exploration)
+| Product | Method | Granularity | History |
+|---------|--------|-------------|---------|
+| RT LMP | ErcotAPI `get_lmp_by_settlement_point` | 5-min | 2020+ |
+| DAM SPP | Scraper `get_dam_spp(year=)` | Hourly | 2020+ |
+| DAM AS | ErcotAPI `get_as_prices` | Hourly | 2020+ |
+| RT SCED MCPC | ErcotAPI data endpoint (NP6-332-CD) | 5-min | Dec 5, 2025+ |
+| Load Actual | Scraper `get_hourly_load_post_settlements` | Hourly | 2020+ |
+| Load Forecast | ErcotAPI `get_load_forecast_by_model` | Hourly | 2020+ |
+| Wind | ErcotAPI `get_wind_actual_and_forecast_hourly` | Hourly | 2020+ |
+| Solar | ErcotAPI `get_solar_actual_and_forecast_hourly` | Hourly | 2020+ |
 
-### Chosen Approach: Era-Aware Full-History Training
-Train on ALL 2020–2026 ERCOT data, with explicit features that tell the agent which market regime it's operating in:
+### Canonical Schema (5-min intervals, UTC)
+Three Parquet tables partitioned by month. Hourly data forward-filled to 5-min. See `src/data/schema.py` for exact column mappings.
 
-- `is_post_rtcb` — binary flag (True after Dec 5, 2025)
-- `rt_as_available` — binary flag (True when real-time AS clearing prices exist)
-- `days_since_rtcb` — continuous feature (0 for pre-RTC+B, increasing after Dec 5)
-
-**Pre-RTC+B intervals:** RT AS price columns are NaN/zero (no RT AS market existed). The agent learns that AS offers had no value before Dec 5. Energy price patterns, load cycles, solar ramps, SoC management fundamentals still transfer.
-
-**Post-RTC+B intervals:** RT AS prices (MCPCs) become available. The agent discovers co-optimization revenue opportunities.
-
-This is honest (we don't hide the structural break), practical (one training pipeline), and produces an analyzable result (attention weights can show how the agent adapts across the regime boundary).
-
-### Data Access
-- **Primary tool:** `gridstatus` Python library (v0.34.0+)
-  - `gridstatus.Ercot` class — web scraping, works for full historical range
-  - `gridstatus.ErcotAPI` class — REST API, data from Dec 2023 onward
-- **ERCOT Public API:** Free registration at apiexplorer.ercot.com
-- **Key data products:**
-  - RT Settlement Point Prices (NP6-905-CD) — 15-min intervals
-  - RT LMPs by SCED interval (NP6-788-CD) — 5-min intervals
-  - DAM Settlement Point Prices (NP4-190-CD) — hourly
-  - **RT AS Clearing Prices / MCPCs (NP6-332-CD)** — 5-min, post-RTC+B only (NEW)
-  - DAM AS Clearing Prices (NP4-188-CD) — hourly, full history
-  - Load, wind/solar actuals and forecasts — various granularities
-
-### Canonical Schema (Parquet, UTC timestamps, 5-min intervals)
-Three tables, partitioned by month:
-- `energy_prices` — RT SPP (hub + zones), DAM SPP, is_post_rtcb flag
-- `as_prices` — RT MCPCs (5 products, NaN pre-RTC+B), DAM AS prices (5 products), is_post_rtcb flag
-- `system_conditions` — load, wind/solar actuals+forecasts, net load, is_post_rtcb flag
-
-Column name mappings from gridstatus → canonical schema need to be determined during data exploration. The preprocessing module has TODO placeholders for this.
+- **energy_prices:** timestamp_utc, rt_lmp, dam_spp
+- **as_prices:** timestamp_utc, rt_mcpc_{regup,regdn,rrs,ecrs,nsrs} (zero pre-RTC+B), dam_as_{regup,regdn,rrs,ecrs,nsrs}
+- **system_conditions:** timestamp_utc, total_load_mw, load_forecast_mw, wind_actual_mw, wind_forecast_mw, solar_actual_mw, solar_forecast_mw, net_load_mw
 
 ---
 
-## TEMPDRL ARCHITECTURE (Li et al. adapted for ERCOT)
+## TEMPDRL ARCHITECTURE
 
-### MDP Formulation
+### Observation Space (78 dimensions total)
 
-**State space** s_t = (SoC_t, ρ_{t-1}, f_{t-1})
-- SoC_t: Current state of charge [MWh] (fraction of E_max)
-- ρ_{t-1}: Latest price vector = [LMP, MCPC_RegUp, MCPC_RegDn, MCPC_RRS, MCPC_ECRS, MCPC_NSRS] (6 values)
-  - Pre-RTC+B: MCPCs are zero; use DAM AS prices as partial proxy or leave as zero
-- f_{t-1}: Temporal feature vector extracted by the TTFE from the last L price observations
+**TTFE Input** — Rolling window of L=32 price vectors, each 11-dim:
+- RT LMP (1)
+- RT MCPC × 5: RegUp, RegDn, RRS, ECRS, NSRS (zeros pre-RTC+B)
+- DAM SPP (1)
+- DAM AS × 5: RegUp, RegDn, RRS, ECRS, NSRS (ECRS zero pre-June 2023)
 
-**ERCOT-specific state augmentation:**
-- `is_post_rtcb` (binary)
-- `days_since_rtcb` (continuous)
-- `hour_of_day`, `day_of_week`, `month` (cyclical encoding)
-- `total_load_mw`, `net_load_mw` (system conditions)
-- `wind_actual_mw`, `solar_actual_mw` (renewable generation)
+**TTFE Output:** 64-dimensional compressed temporal feature vector.
 
-**Action space** a_t ∈ ℝ^6 (continuous, simplified for initial implementation):
-- a_0: Net energy power p_net ∈ [-P_max, P_max] (negative = charge, positive = discharge)
-- a_1-a_5: AS capacity offers [MW] for RegUp, RegDown, RRS, ECRS, NSRS (each ≥ 0)
+**Concatenated with TTFE output (bypasses transformer):**
+- System conditions (7): total_load_mw, load_forecast_mw, wind_actual_mw, wind_forecast_mw, solar_actual_mw, solar_forecast_mw, net_load_mw
+- Cyclical time features (6): hour_of_day sin/cos, day_of_week sin/cos, month sin/cos
+- Battery state (1): SoC_t
 
-**Constraints on actions (enforced by feasibility projection layer):**
-- p_discharge + Σ(RegUp, RRS, ECRS) ≤ P_max (joint upward capacity)
+**Full actor/critic input: 64 + 7 + 6 + 1 = 78 dimensions.**
+
+Rationale: TTFE processes temporal price dynamics at 5-min resolution. System conditions are hourly forward-filled — putting them through the transformer would dilute attention. Concatenation keeps the TTFE focused on price structure while giving the policy access to system state.
+
+### Action Space
+
+**Stage 1 (energy_only):** a_t ∈ ℝ¹
+- a_0: Net energy power p_net ∈ [-P_max, P_max]
+
+**Stage 2 (co_optimize):** a_t ∈ ℝ⁶
+- a_0: Net energy power p_net ∈ [-P_max, P_max]
+- a_1–a_5: AS capacity offers [MW] for RegUp, RegDown, RRS, ECRS, NSRS (each ≥ 0)
+
+### Feasibility Projection
+
+**Stage 1:** Simple SoC/power clipping:
+- |p_net| ≤ P_max
+- SoC_min ≤ SoC_{t+1} ≤ SoC_max
+
+**Stage 2:** Full AS constraint projection (applied after actor, before environment):
+- p_discharge + RegUp + RRS + ECRS ≤ P_max (joint upward capacity)
 - p_charge + RegDown ≤ P_max (joint downward capacity)
-- SoC must support AS duration requirements:
-  - RegUp/RegDown: 0.5 MWh per 1 MW award (30-min sustain)
-  - RRS (PFR/UFR): 0.5 MWh per 1 MW (30-min sustain)
-  - RRS (FFR): 0.25 MWh per 1 MW (15-min sustain)
+- SoC duration requirements:
+  - RegUp/RegDown: 0.5 MWh per 1 MW (30-min sustain)
+  - RRS: 0.5 MWh per 1 MW (30-min sustain)
   - ECRS: 1.0 MWh per 1 MW (1-hour sustain)
   - Non-Spin: 4.0 MWh per 1 MW (4-hour sustain)
-- Total SoC reservation: SoC_t ≥ SoC_min + Σ(c_k × duration_k) for all awarded AS products
+- SoC_t ≥ SoC_min + Σ(c_k × duration_k) for all awarded AS products
+- Critics see projected (feasible) actions, not raw outputs.
 
-**Note:** The full 10-point EB/OC bid curve output is DEFERRED. Initial implementation uses scalar power outputs. The bid curve parameterization is a future refinement.
+### Reward Function
 
-**Reward function** r_t:
+**Stage 1:**
+```
+r_t = Revenue_Energy - Cost_Degradation
+```
+
+**Stage 2:**
 ```
 r_t = Revenue_Energy + Σ Revenue_AS,i - Cost_Degradation - Penalty_SPD - Penalty_Imbalance
 ```
 
 Where:
 - Revenue_Energy = Δt × (p_dch × η_dch - p_ch / η_ch) × LMP_t
-- Revenue_AS,i = Δt × c_i × MCPC_i,t (for each AS product i)
+- Revenue_AS,i = Δt × c_i × MCPC_i,t
 - Cost_Degradation = C_deg × (p_ch + p_dch) × Δt
 - Penalty_SPD = -β_SPD × max(0, |a_t - p_actual| - δ) where δ = max(0.03 × |avg_set_point|, 3 MW)
 - Penalty_Imbalance = cost of failing to sustain AS capacity if SoC drops below required level
 
-### Transformer Temporal Feature Extractor (TTFE)
+### TTFE Architecture
 
-Processes a rolling window of L historical price vectors:
-- Input: S_t = [ρ_{t-L+1}, ..., ρ_t] — shape (L, n_prices)
-- Multi-Head Attention: S_j^SA = softmax(Q_j K_j^T / √F') × V_j
-- Output: f_t — compressed temporal feature vector
-
-**Key hyperparameters:**
-- L (segment length): Start with 32 intervals (~2.7 hours). This is what Li et al. used.
-- n_heads: 4 (Li et al. default)
-- d_model: 64 (embedding dimension)
+- Input: S_t = [ρ_{t-L+1}, ..., ρ_t] — shape (L=32, 11)
+- Multi-Head Self-Attention: 4 heads
+- d_model: 64
 - n_layers: 2 transformer layers
+- Output: f_t — 64-dimensional temporal feature vector
 
-### SAC Algorithm
+### SAC Hyperparameters
 
-Standard Soft Actor-Critic with:
 - Automatic entropy coefficient tuning (α)
 - Twin Q-networks (clipped double Q-learning)
-- Target network with soft update (τ = 0.005)
-- Replay buffer size: 1,000,000 transitions
-- Batch size: 256
-- Learning rate: 3e-4 (actor and critic)
+- Target network soft update: τ = 0.005
 - Discount factor γ: 0.99
 - Actor: 2 hidden layers × 256 units, ReLU
 - Critic: 2 hidden layers × 256 units, ReLU
-- TTFE feeds into both actor and critic as the observation encoder
+- Learning rate: 3e-4 (Stage 1), adjustable for Stage 2
+
+**Stage 1:**
+- Replay buffer: 1,000,000 transitions
+- Batch size: 256
+
+**Stage 2:**
+- Replay buffer: 30,000–50,000 transitions
+- Batch size: 128
+- Fewer gradient steps per env step to avoid overfitting
+
+---
+
+## TWO-STAGE TRAINING PROTOCOL
+
+### Stage 1: Energy-Only Pretraining (Pre-RTC+B)
+
+**Data:** 2020-01-01 → 2025-12-04 (~525k transitions)
+**Environment mode:** `energy_only` (1D action)
+**Goal:** Learn temporal price patterns, SoC management, energy arbitrage
+
+Train until convergence:
+- TTFE + 1D actor + twin critics
+- Standard SAC with Li et al. hyperparameters
+- Replay buffer: 1M, batch: 256
+
+**Checkpoint:** Save TTFE weights + actor weights.
+
+### Stage 2: Co-optimization Finetuning (Post-RTC+B)
+
+**Data:** 2025-12-05 → 2026-03-20 (~30k transitions)
+**Environment mode:** `co_optimize` (6D action)
+**Goal:** Learn AS capacity allocation and joint energy+AS optimization
+
+**Initialization:**
+- TTFE: Load Stage 1 weights
+- 6D Actor: Energy output dimension initialized from Stage 1 actor's final layer. AS output dimensions initialized near zero (small Gaussian weights, zero bias).
+- Twin Critics: Fresh random initialization.
+- Replay buffer: Empty, post-RTC+B only.
+
+**Progressive Unfreezing Schedule:**
+
+*Phase 1 — Frozen encoder warm-up:*
+- Freeze all TTFE parameters
+- Train new 6D actor + fresh critics
+- LR: 1e-3 for heads (or whatever worked in Stage 1)
+- Until: losses stabilize, policy stops making insane bids
+
+*Phase 2 — Partial unfreeze:*
+- Unfreeze top 1–2 TTFE transformer layers
+- Keep lower layers frozen
+- TTFE LR: 10× smaller than heads
+- Continue on post-RTC+B only
+
+*Phase 3 (optional) — Full unfreeze:*
+- If validation backtests show underfitting to AS patterns
+- Unfreeze all TTFE with very low LR
+- Short fine-tune pass
 
 ---
 
@@ -178,160 +221,149 @@ Standard Soft Actor-Critic with:
 | C_degradation | $2/MWh throughput |
 | Ramp rate | 10 MW/min (full capacity in 1 min) |
 
-Configured in `configs/battery.yaml`.
-
 ---
 
 ## BASELINES FOR COMPARISON
 
-1. **TBx (Time-Based Arbitrage):** Charge cheapest 4 hours, discharge most expensive 4 hours daily. No AS. Expected: ~40-50% of perfect foresight. Already implemented in `src/baselines/tbx.py`.
-
-2. **Energy-Only Perfect Foresight MIP:** Solve energy-only optimization with actual future prices using CVXPY + HiGHS. This is the theoretical ceiling for energy-only strategies. Already implemented in `src/baselines/perfect_foresight.py`.
-
-3. **Predict-and-Optimize (P&O) benchmark** (to implement later): XGBoost price forecast → energy-only MIP. This is the benchmark Li et al. compared TempDRL against (~23-24% improvement).
+1. **TBx (Time-Based Arbitrage):** Charge cheapest 4 hours, discharge most expensive 4 hours daily. No AS. Already implemented.
+2. **Energy-Only Perfect Foresight MIP:** CVXPY + HiGHS. Theoretical energy-only ceiling. Already implemented.
+3. **Predict-and-Optimize (P&O):** XGBoost forecast → MIP. Deferred — implement if time permits.
 
 ---
 
-## EXISTING CODE (Week 1 Scaffold)
-
-The project already has a working scaffold in the `hybridbid/` directory:
+## EXISTING CODE
 
 ```
 hybridbid/
 ├── configs/
-│   ├── battery.yaml              # Battery parameters (10MW/20MWh reference)
-│   └── data_products.yaml        # ERCOT data product IDs and access config
+│   ├── battery.yaml
+│   └── data_products.yaml
 ├── data/
-│   ├── raw/                      # Downloaded ERCOT files
-│   ├── processed/                # Clean Parquet files (canonical schema)
-│   ├── mappings/                 # ESR combo→single model mapping
-│   └── results/                  # Baseline and evaluation outputs
-├── notebooks/
-│   └── 01_data_exploration.ipynb # Day 1 exploration notebook
+│   ├── raw/                      # Daily Parquet files per product
+│   │   ├── rt_lmp/
+│   │   ├── dam_spp/
+│   │   ├── dam_as/
+│   │   ├── load_actual/
+│   │   ├── load_forecast/
+│   │   ├── wind/
+│   │   ├── solar/
+│   │   └── sced_mcpc/            # 107 daily files (Dec 5, 2025 – Mar 20, 2026)
+│   ├── processed/                # Canonical schema Parquet (5-min, UTC)
+│   └── results/
 ├── src/
 │   ├── data/
-│   │   ├── pipeline.py           # Main ingestion orchestrator
-│   │   ├── ercot_fetcher.py      # gridstatus wrapper (API + scraping)
-│   │   ├── schema.py             # Canonical Parquet schema definitions
+│   │   ├── pipeline.py           # Orchestrator with rate limiting
+│   │   ├── ercot_fetcher.py      # Confirmed access methods per product
+│   │   ├── schema.py             # Validated column mappings
 │   │   └── preprocessing.py      # Cleaning, alignment, resampling
 │   ├── baselines/
-│   │   ├── tbx.py                # Time-based arbitrage baseline
-│   │   ├── perfect_foresight.py  # Energy-only MIP (CVXPY + HiGHS)
-│   │   └── run_baselines.py      # CLI runner
+│   │   ├── tbx.py
+│   │   ├── perfect_foresight.py
+│   │   └── run_baselines.py
 │   ├── evaluation/
-│   │   ├── metrics.py            # Revenue, TB2 capture, constraint compliance
-│   │   └── visualization.py      # Revenue curves, SoC trajectories, plots
+│   │   ├── metrics.py
+│   │   └── visualization.py
 │   └── utils/
-│       ├── time_utils.py         # CPT/UTC conversion, ERCOT hour-ending
-│       └── battery_sim.py        # Battery state simulator (13 tests pass)
+│       ├── time_utils.py
+│       └── battery_sim.py        # 13 tests pass
 ├── tests/
-│   └── test_battery_sim.py       # Battery simulator unit tests (all pass)
+│   └── test_battery_sim.py
+├── .env                          # ERCOT API credentials (gitignored)
+├── .gitignore
 ├── requirements.txt
 └── README.md
 ```
 
-**Status:** All 13 battery simulator tests pass. Preprocessing module has TODO placeholders for column mappings that must be filled after data exploration.
-
-**What needs to be added (Weeks 3-8):**
+**To be added (Weeks 3-4):**
 ```
 ├── src/
 │   ├── models/
 │   │   ├── ttfe.py               # Transformer Temporal Feature Extractor
 │   │   ├── sac.py                # Soft Actor-Critic agent
-│   │   ├── networks.py           # Actor, Critic, and shared network architectures
+│   │   ├── networks.py           # Actor, Critic, shared architectures
+│   │   ├── feasibility.py        # Action feasibility projection
 │   │   └── replay_buffer.py      # Experience replay buffer
 │   ├── env/
-│   │   ├── ercot_env.py          # Gymnasium-compatible ERCOT battery environment
-│   │   └── feasibility.py        # Action feasibility projection (AS constraints)
+│   │   └── ercot_env.py          # Gymnasium env with energy_only / co_optimize modes
 │   └── training/
-│       ├── train.py              # Training loop
+│       ├── train_stage1.py       # Stage 1 pretraining loop
+│       ├── train_stage2.py       # Stage 2 finetuning with progressive unfreezing
 │       └── config.py             # Hyperparameter configuration
 ```
 
 ---
 
-## 8-WEEK PLAN
+## TRAIN / VALIDATION / TEST SPLITS
 
-### Weeks 1-2: Data Pipeline + Baselines
-- [x] Project scaffold built
-- [x] Battery simulator implemented and tested
-- [ ] Run data exploration notebook — discover actual gridstatus column names
-- [ ] Update preprocessing.py column mappings based on exploration findings
-- [ ] Run data pipeline for 2024-2026 (priority) then backfill 2020-2023
-- [ ] Run TBx and perfect foresight baselines
-- [ ] Confirm post-RTC+B AS data (NP6-332-CD MCPCs) is accessible
-- [ ] **Go/No-Go #1:** Data pipeline working, baselines producing numbers
+| Split | Period | Stage |
+|-------|--------|-------|
+| Train Stage 1 | 2020-01-01 → 2023-12-31 | Stage 1 (energy-only) |
+| Validation Stage 1 | 2024-01-01 → 2025-09-30 | Stage 1 hyperparameter tuning |
+| Test Pre-RTC+B | 2025-10-01 → 2025-12-04 | Stage 1 evaluation |
+| Train Stage 2 | 2025-12-05 → 2026-01-31 | Stage 2 (co-optimize) |
+| Validation Stage 2 | 2026-02-01 → 2026-02-28 | Stage 2 hyperparameter tuning |
+| Test Post-RTC+B | 2026-03-01 → present | Stage 2 out-of-sample evaluation |
+
+---
+
+## REVISED WEEK PLAN
+
+### Weeks 1-2: Data Pipeline + Baselines ✅
+- [x] Project scaffold
+- [x] Battery simulator (13 tests pass)
+- [x] Data exploration (Phase 1 + 1b)
+- [x] Pipeline rebuild with confirmed mappings
+- [x] MCPC data downloaded (107 days)
+- [x] Pipeline validated on Jan 6-12, 2026
+- [x] Git repo initialized
+- [ ] Full 2020-2026 backfill (in progress on Air)
+- [ ] Run baselines on test periods
 
 ### Weeks 3-4: TempDRL Implementation
-- [ ] Implement TTFE (Transformer Temporal Feature Extractor)
-- [ ] Implement SAC agent with TTFE as observation encoder
-- [ ] Build Gymnasium-compatible ERCOT environment wrapper
-- [ ] Implement reward function with ERCOT-specific penalties (SPD, AS imbalance)
-- [ ] Implement action feasibility projection (AS duration/SoC constraints)
-- [ ] Verify training loop runs end-to-end on a small data slice
-- [ ] **Go/No-Go #2:** Agent training loop working, loss curves decreasing
+- [ ] Implement TTFE (transformer temporal feature extractor)
+- [ ] Implement SAC agent (networks, replay buffer)
+- [ ] Implement feasibility projection (Stage 1 simple + Stage 2 full)
+- [ ] Build Gymnasium environment (energy_only + co_optimize modes)
+- [ ] Implement Stage 1 training loop
+- [ ] Implement Stage 2 training loop with progressive unfreezing
+- [ ] Verify Stage 1 trains end-to-end on small data slice
+- [ ] **Go/No-Go:** Stage 1 loss curves decreasing, policy beats random
 
 ### Weeks 5-6: Training + Evaluation
-- [ ] Train on full 2020-2026 dataset with era-aware features
-- [ ] Hyperparameter sweep: L (segment length), learning rate, replay buffer size
-- [ ] Evaluate on held-out test sets:
-  - Test Set 1 (pre-RTC+B): Oct-Nov 2025
-  - Test Set 2 (post-RTC+B): Dec 2025-Jan 2026
-  - Test Set 3 (ongoing): Feb 2026+
-- [ ] Compare against baselines (TBx, perfect foresight)
-- [ ] **Go/No-Go #3:** Agent outperforms TBx baseline
+- [ ] Stage 1 full training on 2020-2023 data
+- [ ] Stage 1 validation on 2024-Sep 2025
+- [ ] Stage 2 Phase 1: frozen encoder warm-up
+- [ ] Stage 2 Phase 2: partial unfreeze
+- [ ] Stage 2 Phase 3 (if needed): full unfreeze
+- [ ] Evaluate on test sets, compare against baselines
+- [ ] **Go/No-Go:** Stage 2 agent outperforms TBx baseline
 
 ### Weeks 7-8: Analysis + Write-up
-- [ ] Attention weight visualization (what temporal patterns does the TTFE learn?)
-- [ ] Pre vs. post RTC+B performance analysis (natural experiment)
-- [ ] Revenue decomposition (energy vs. each AS product)
-- [ ] Sensitivity analysis across battery configurations (5 MW, 10 MW, 20 MW)
+- [ ] TTFE attention weight visualization
+- [ ] Stage 1 vs Stage 2 representation analysis
+- [ ] Revenue decomposition (energy vs each AS product)
+- [ ] Sensitivity analysis across battery configurations
 - [ ] Draft results section and figures
 
 ---
 
-## TRAIN / VALIDATION / TEST SPLITS
+## EXPLICITLY DEFERRED
 
-| Split | Period | Purpose |
-|-------|--------|---------|
-| Train | 2020-01-01 → 2023-12-31 | Main training data (pre-RTC+B only) |
-| Validation | 2024-01-01 → 2025-09-30 | Hyperparameter tuning |
-| Test Pre-RTC+B | 2025-10-01 → 2025-12-04 | Natural experiment control |
-| Test Post-RTC+B | 2025-12-05 → 2026-01-31 | Natural experiment treatment |
-| Test Ongoing | 2026-02-01 → present | Out-of-sample evaluation |
-
----
-
-## EXPLICITLY DEFERRED (Future Work)
-
-- 10-point EB/OC bid curve output (parameterized action space)
+- 10-point EB/OC bid curve output
 - DreamerV3 / model-based RL comparison
-- Cross-market transfer learning (pre-train on Australia NEM or NYISO data)
-- MIP with full AS co-optimization (energy-only MIP is sufficient as baseline)
+- Cross-market transfer learning
+- MIP with full AS co-optimization
 - LLM context module
-- Meta-controller / hybrid MIP+RL routing
-- Predict-and-Optimize (P&O) benchmark (implement if time permits in Week 6)
+- Meta-controller / hybrid routing
+- Predict-and-Optimize benchmark (implement if time permits)
+- Era-aware features (replaced by two-stage training)
 
 ---
 
 ## KEY REFERENCES
 
-1. **Li et al. (2024)** — "Temporal-Aware Deep Reinforcement Learning for Energy Storage Bidding in Energy and Contingency Reserve Markets." IEEE TEMPR. arXiv:2402.19110. **This is the paper we're implementing.**
-2. **ERCOT RTC+B Battery Overview** — https://www.ercot.com/files/docs/2025/07/15/RTC-B-Battery-Overview.pdf
-3. **ERCOT RTC+B Go-Live Announcement** — https://www.ercot.com/news/release/12052025-ercot-goes-live
-4. **Modo Energy: RTC+B AS Duration Requirements** — https://modoenergy.com/research/en/rtcb-real-time-cooptimization-rtc-ercot-ancillary-service-duration-soc-management
-5. **Tyba Energy: Guide to ERCOT RTC+B** — https://www.tyba.ai/resources/guides/guide-to-ercot-rtcb/
-6. **gridstatus library** — https://github.com/gridstatus/gridstatus (v0.34.0+, BSD-3 license)
-
----
-
-## IMMEDIATE NEXT STEP
-
-**Start with data exploration.** Run the notebook `notebooks/01_data_exploration.ipynb` or equivalent exploration to:
-1. Install gridstatus, inspect available methods for ERCOT
-2. Pull 1 week of sample data for each key product (pre and post RTC+B)
-3. Document actual column names, data types, granularity
-4. Confirm RT AS MCPCs (NP6-332-CD) are accessible post-RTC+B
-5. Check how far back historical data is accessible via gridstatus
-
-Report findings before proceeding to pipeline implementation. Do not build further until column mappings are confirmed.
+1. **Li et al. (2024)** — arXiv:2402.19110. **Primary implementation reference.**
+2. **ERCOT RTC+B Battery Overview** — ercot.com
+3. **gridstatus library** — github.com/gridstatus/gridstatus (v0.35.0)
+4. **Ascend Analytics RTC+B blog** — ascendanalytics.com (market context)
+5. **SYSO Technologies RTC+B overview** — sysotechnologies.com (operational context)
