@@ -1,8 +1,10 @@
 # Data
 data/raw/
-data/processed/
 data/results/
-*.parquet
+processed_data.tar.gz
+
+# Processed data is tracked (24MB — small enough for git)
+# data/processed/ is intentionally NOT ignored
 
 # Training artifacts
 checkpoints/
