@@ -1,11 +1,15 @@
 """
 Actor and Critic networks for SAC.
 
-Actor: Squashed Gaussian policy (outputs mean + log_std for reparameterization).
+Actor: Hybrid discrete-continuous policy.
+  - Mode selection (charge/discharge/idle) via Gumbel-Softmax
+  - Continuous magnitude via squashed Gaussian
+  Matches Li et al. (2024) Eq. 1, 23.
+
 Critic: Twin Q-networks for clipped double-Q learning.
 """
 
-import copy
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -14,88 +18,173 @@ from torch.distributions import Normal
 LOG_STD_MIN = -20
 LOG_STD_MAX = 2
 
+# Mode indices
+MODE_CHARGE = 0
+MODE_DISCHARGE = 1
+MODE_IDLE = 2
+
 
 class Actor(nn.Module):
     """
-    Squashed Gaussian actor for SAC.
+    Hybrid discrete-continuous actor for SAC.
 
-    Input:  78-dim (TTFE 64 + system 7 + time 6 + SoC 1)
-    Output: action_dim mean and log_std for reparameterized sampling
+    Discrete part: 3-class mode (charge / discharge / idle) via Gumbel-Softmax.
+    Continuous part: energy magnitude [squashed Gaussian in (-1,1)].
+    Stage 2 extension: additional AS magnitudes (n_as_dims=5).
+
+    Total action dim = 3 + 1 + n_as_dims
+      Stage 1: 4  (3 mode + 1 energy mag)
+      Stage 2: 9  (3 mode + 1 energy mag + 5 AS mags)
+
+    Input:  90-dim (TTFE 64 + current prices 12 + static 14)
     """
 
-    def __init__(self, obs_dim: int = 78, action_dim: int = 1, hidden_dim: int = 256):
+    def __init__(self, obs_dim: int = 90, n_as_dims: int = 0, hidden_dim: int = 256):
         super().__init__()
         self.obs_dim = obs_dim
-        self.action_dim = action_dim
+        self.n_as_dims = n_as_dims
+        self.action_dim = 3 + 1 + n_as_dims  # total flattened action
 
+        # Shared trunk
         self.fc1 = nn.Linear(obs_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
-        self.mean_head = nn.Linear(hidden_dim, action_dim)
-        self.log_std_head = nn.Linear(hidden_dim, action_dim)
+
+        # Mode head: 3 logits (charge / discharge / idle)
+        self.mode_head = nn.Linear(hidden_dim, 3)
+
+        # Energy magnitude head
+        self.energy_mag_mean_head = nn.Linear(hidden_dim, 1)
+        self.energy_mag_log_std_head = nn.Linear(hidden_dim, 1)
+
+        # AS magnitude heads (Stage 2 only)
+        if n_as_dims > 0:
+            self.as_mag_mean_head = nn.Linear(hidden_dim, n_as_dims)
+            self.as_mag_log_std_head = nn.Linear(hidden_dim, n_as_dims)
 
     def forward(self, obs: torch.Tensor):
-        """Return mean, log_std for the squashed Gaussian."""
+        """
+        Returns
+        -------
+        mode_logits      : (batch, 3)
+        energy_mag_mean  : (batch, 1)
+        energy_mag_log_std : (batch, 1)
+        [as_mag_mean     : (batch, n_as_dims)]  — only when n_as_dims > 0
+        [as_mag_log_std  : (batch, n_as_dims)]
+        """
         h = F.relu(self.fc1(obs))
         h = F.relu(self.fc2(h))
-        mean = self.mean_head(h)
-        log_std = self.log_std_head(h)
-        log_std = torch.clamp(log_std, LOG_STD_MIN, LOG_STD_MAX)
-        return mean, log_std
 
-    def sample(self, obs: torch.Tensor):
+        mode_logits = self.mode_head(h)
+        energy_mag_mean = self.energy_mag_mean_head(h)
+        energy_mag_log_std = torch.clamp(
+            self.energy_mag_log_std_head(h), LOG_STD_MIN, LOG_STD_MAX
+        )
+
+        if self.n_as_dims > 0:
+            as_mag_mean = self.as_mag_mean_head(h)
+            as_mag_log_std = torch.clamp(
+                self.as_mag_log_std_head(h), LOG_STD_MIN, LOG_STD_MAX
+            )
+            return mode_logits, energy_mag_mean, energy_mag_log_std, as_mag_mean, as_mag_log_std
+
+        return mode_logits, energy_mag_mean, energy_mag_log_std
+
+    def sample(self, obs: torch.Tensor, tau: float = 1.0, hard: bool = False):
         """
-        Sample action via reparameterization trick with tanh squashing.
+        Sample action via Gumbel-Softmax (mode) + reparameterization (magnitudes).
+
+        Parameters
+        ----------
+        tau : float
+            Gumbel-Softmax temperature. Start at 1.0, anneal toward 0.1.
+        hard : bool
+            If True, use straight-through hard one-hot (for deterministic eval).
 
         Returns
         -------
-        action : Tensor (batch, action_dim) in [-1, 1]
-        log_prob : Tensor (batch, 1)
-        mean : Tensor (batch, action_dim) — deterministic action (tanh of mean)
+        action    : (batch, action_dim) — cat([mode_soft/hard, energy_mag, as_mags?])
+        log_prob  : (batch, 1) — sum of mode + magnitude log-probs
+        det_action : (batch, action_dim) — deterministic: argmax mode + tanh(mean)
         """
-        mean, log_std = self.forward(obs)
-        std = log_std.exp()
-        normal = Normal(mean, std)
-        # Reparameterization trick
-        x_t = normal.rsample()
-        action = torch.tanh(x_t)
+        outputs = self.forward(obs)
+        mode_logits = outputs[0]
+        energy_mag_mean = outputs[1]
+        energy_mag_log_std = outputs[2]
 
-        # Log-prob with tanh correction
-        log_prob = normal.log_prob(x_t)
-        log_prob -= torch.log(1 - action.pow(2) + 1e-6)
-        log_prob = log_prob.sum(dim=-1, keepdim=True)
+        # --- Mode: Gumbel-Softmax ---
+        mode_sample = F.gumbel_softmax(mode_logits, tau=tau, hard=hard)  # (batch, 3)
 
-        return action, log_prob, torch.tanh(mean)
+        # Log-prob of mode: E_{q}[log p(mode)] under categorical
+        mode_probs = F.softmax(mode_logits, dim=-1)  # (batch, 3)
+        log_prob_mode = (mode_sample * torch.log(mode_probs + 1e-8)).sum(dim=-1, keepdim=True)
+
+        # --- Energy magnitude: squashed Gaussian ---
+        energy_std = energy_mag_log_std.exp()
+        energy_normal = Normal(energy_mag_mean, energy_std)
+        x_energy = energy_normal.rsample()
+        energy_mag = torch.tanh(x_energy)  # ∈ (-1, 1)
+
+        log_prob_energy = energy_normal.log_prob(x_energy)
+        log_prob_energy -= torch.log(1 - energy_mag.pow(2) + 1e-6)
+        log_prob_energy = log_prob_energy.sum(dim=-1, keepdim=True)
+
+        log_prob = log_prob_mode + log_prob_energy
+        action_parts = [mode_sample, energy_mag]
+
+        # Deterministic counterparts
+        hard_mode = F.one_hot(mode_logits.argmax(dim=-1), 3).float()
+        det_energy_mag = torch.tanh(energy_mag_mean)
+        det_parts = [hard_mode, det_energy_mag]
+
+        # --- AS magnitudes (Stage 2) ---
+        if self.n_as_dims > 0:
+            as_mag_mean = outputs[3]
+            as_mag_log_std = outputs[4]
+            as_std = as_mag_log_std.exp()
+            as_normal = Normal(as_mag_mean, as_std)
+            x_as = as_normal.rsample()
+            as_mag = torch.tanh(x_as)  # ∈ (-1, 1), env takes abs
+
+            log_prob_as = as_normal.log_prob(x_as)
+            log_prob_as -= torch.log(1 - as_mag.pow(2) + 1e-6)
+            log_prob_as = log_prob_as.sum(dim=-1, keepdim=True)
+
+            log_prob = log_prob + log_prob_as
+            action_parts.append(as_mag)
+            det_parts.append(torch.tanh(as_mag_mean))
+
+        action = torch.cat(action_parts, dim=-1)
+        det_action = torch.cat(det_parts, dim=-1)
+
+        return action, log_prob, det_action
 
     @classmethod
-    def init_stage2_from_stage1(cls, stage1_actor: "Actor", action_dim: int = 6) -> "Actor":
+    def init_stage2_from_stage1(cls, stage1_actor: "Actor", n_as_dims: int = 5) -> "Actor":
         """
-        Create a 6D actor initialized from a trained 1D Stage 1 actor.
+        Create a Stage 2 actor initialized from a trained Stage 1 actor.
 
-        - Hidden layers copied exactly
-        - Energy dim (row 0) of output copied from Stage 1
-        - AS dims (rows 1-5) initialized with small Gaussian weights
+        - All Stage 1 components (trunk, mode head, energy mag heads) copied exactly.
+        - AS magnitude heads initialized near-zero (small Gaussian weights, zero bias).
         """
-        actor2 = cls(obs_dim=stage1_actor.obs_dim, action_dim=action_dim,
-                      hidden_dim=stage1_actor.fc1.out_features)
+        actor2 = cls(
+            obs_dim=stage1_actor.obs_dim,
+            n_as_dims=n_as_dims,
+            hidden_dim=stage1_actor.fc1.out_features,
+        )
 
-        # Copy hidden layers
+        # Copy all Stage 1 components
         actor2.fc1.load_state_dict(stage1_actor.fc1.state_dict())
         actor2.fc2.load_state_dict(stage1_actor.fc2.state_dict())
+        actor2.mode_head.load_state_dict(stage1_actor.mode_head.state_dict())
+        actor2.energy_mag_mean_head.load_state_dict(stage1_actor.energy_mag_mean_head.state_dict())
+        actor2.energy_mag_log_std_head.load_state_dict(stage1_actor.energy_mag_log_std_head.state_dict())
 
-        # Initialize mean head
+        # AS heads: near-zero initialization
         with torch.no_grad():
-            # Energy dim from Stage 1
-            actor2.mean_head.weight[0] = stage1_actor.mean_head.weight[0]
-            actor2.mean_head.bias[0] = stage1_actor.mean_head.bias[0]
-            # AS dims: small Gaussian
-            actor2.mean_head.weight[1:].normal_(0, 0.01)
-            actor2.mean_head.bias[1:].zero_()
-
-            # Initialize log_std head
-            actor2.log_std_head.weight[0] = stage1_actor.log_std_head.weight[0]
-            actor2.log_std_head.bias[0] = stage1_actor.log_std_head.bias[0]
-            actor2.log_std_head.weight[1:].normal_(0, 0.01)
-            actor2.log_std_head.bias[1:].zero_()
+            actor2.as_mag_mean_head.weight.normal_(0, 0.01)
+            actor2.as_mag_mean_head.bias.zero_()
+            actor2.as_mag_log_std_head.weight.normal_(0, 0.01)
+            actor2.as_mag_log_std_head.bias.zero_()
 
         return actor2
 
@@ -103,7 +192,7 @@ class Actor(nn.Module):
 class Critic(nn.Module):
     """Single Q-network: Q(obs, action) -> scalar."""
 
-    def __init__(self, obs_dim: int = 78, action_dim: int = 1, hidden_dim: int = 256):
+    def __init__(self, obs_dim: int = 90, action_dim: int = 4, hidden_dim: int = 256):
         super().__init__()
         self.fc1 = nn.Linear(obs_dim + action_dim, hidden_dim)
         self.fc2 = nn.Linear(hidden_dim, hidden_dim)
@@ -119,7 +208,7 @@ class Critic(nn.Module):
 class TwinCritic(nn.Module):
     """Twin Q-networks for clipped double-Q learning."""
 
-    def __init__(self, obs_dim: int = 78, action_dim: int = 1, hidden_dim: int = 256):
+    def __init__(self, obs_dim: int = 90, action_dim: int = 4, hidden_dim: int = 256):
         super().__init__()
         self.q1 = Critic(obs_dim, action_dim, hidden_dim)
         self.q2 = Critic(obs_dim, action_dim, hidden_dim)

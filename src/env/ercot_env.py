@@ -2,10 +2,15 @@
 ERCOT Battery Bidding Gymnasium Environment.
 
 Supports two modes:
-  - energy_only (Stage 1): 1D action, energy arbitrage only
-  - co_optimize (Stage 2): 6D action, energy + ancillary services
+  - energy_only (Stage 1): 4D action [mode(3) + energy_mag(1)]
+  - co_optimize (Stage 2): 9D action [mode(3) + energy_mag(1) + as_mags(5)]
 
 Each episode = 1 operating day (288 five-minute steps).
+
+Reward follows Li et al. (2024) Eq. 26-30:
+  - Spot market reward with EMA arbitrage shaping (τ_S=0.9, β_S=10)
+  - No degradation cost in step reward (not in paper's Eq. 30)
+  - Episode terminates with -50 penalty when SoC would violate limits
 """
 
 import glob
@@ -21,11 +26,11 @@ from src.models.feasibility import project_energy_only, project_co_optimize
 from src.utils.battery_sim import BatteryParams
 
 
-# Battery defaults
+# Battery defaults — Li et al. Table I uses η=0.95
 DEFAULT_BATTERY = dict(
     p_max=10.0, e_max=20.0,
     soc_min_frac=0.10, soc_max_frac=0.90, soc_initial_frac=0.50,
-    eta_ch=0.92, eta_dch=0.92,
+    eta_ch=0.95, eta_dch=0.95,
     degradation_cost=2.0,
 )
 
@@ -33,8 +38,17 @@ DELTA_T_HOURS = 5.0 / 60.0
 STEPS_PER_DAY = 288
 SEQ_LEN = 32
 
+# Li et al. Eq. 26 reward parameters
+EMA_TAU = 0.9     # τ_S: EMA smoothing factor
+BETA_ARB = 10.0   # β_S: EMA arbitrage bonus coefficient
+SOC_PENALTY = 50.0  # penalty for SoC limit violation
+
+# Action layout (mode one-hot always first 3 dims)
+MODE_CHARGE = 0
+MODE_DISCHARGE = 1
+MODE_IDLE = 2
+
 # Price vector column ordering (12 dims)
-# CLAUDE.md says 11-dim but lists 12 items (1+5+1+5). Using all 12.
 PRICE_COLS = [
     "rt_lmp",
     "rt_mcpc_regup", "rt_mcpc_regdn", "rt_mcpc_rrs", "rt_mcpc_ecrs", "rt_mcpc_nsrs",
@@ -56,8 +70,10 @@ class ERCOTBatteryEnv(gym.Env):
     """
     Gymnasium environment for ERCOT battery bidding.
 
-    Observation: dict with price_history (seq_len, 11) and static_features (14,)
-    Action: Box in [-1, 1], dim 1 (energy_only) or 6 (co_optimize)
+    Observation: dict with price_history (seq_len, 12) and static_features (14,)
+    Action:
+      energy_only:  Box(-1, 1, (4,))  — [mode(3), energy_mag(1)]
+      co_optimize:  Box(-1, 1, (9,))  — [mode(3), energy_mag(1), as_mags(5)]
     """
 
     metadata = {"render_modes": []}
@@ -69,9 +85,6 @@ class ERCOTBatteryEnv(gym.Env):
         battery_config: Optional[dict] = None,
         seq_len: int = SEQ_LEN,
         date_range: Optional[tuple] = None,
-        randomize_initial_soc: bool = False,
-        ema_tau: float = 0.95,
-        beta_arb: float = 0.5,
     ):
         """
         Parameters
@@ -86,16 +99,10 @@ class ERCOTBatteryEnv(gym.Env):
             TTFE lookback window length.
         date_range : tuple of (start_date, end_date) strings, optional
             Filter data to this date range.
-        randomize_initial_soc : bool
-            If True, randomize SoC at episode start between 20% and 80%.
         """
         super().__init__()
         assert mode in ("energy_only", "co_optimize")
         self.mode = mode
-        self.randomize_initial_soc = randomize_initial_soc
-        self.ema_tau = ema_tau
-        self.beta_arb = beta_arb
-        self.ema_price = 0.0
         self.seq_len = seq_len
 
         # Battery config
@@ -113,7 +120,9 @@ class ERCOTBatteryEnv(gym.Env):
         self.soc_max = self.soc_max_frac * self.e_max
 
         # Action/observation spaces
-        action_dim = 1 if mode == "energy_only" else 6
+        # Stage 1: [mode(3) + energy_mag(1)] = 4D
+        # Stage 2: [mode(3) + energy_mag(1) + as_mags(5)] = 9D
+        action_dim = 4 if mode == "energy_only" else 9
         self.action_space = gym.spaces.Box(
             low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32
         )
@@ -133,8 +142,9 @@ class ERCOTBatteryEnv(gym.Env):
         self.soc = self.soc_initial_frac * self.e_max
         self.current_step = 0
         self.current_day_idx = 0
-        self.day_starts = []  # indices into self.data where each day begins
+        self.day_starts = []
         self._build_day_index()
+        self.ema_price = 0.0
 
     def _load_data(self, data_dir: str, date_range: Optional[tuple]):
         """Load and merge all three Parquet tables."""
@@ -163,19 +173,16 @@ class ERCOTBatteryEnv(gym.Env):
         merged[PRICE_COLS] = merged[PRICE_COLS].fillna(0.0)
         merged[SYSTEM_COLS] = merged[SYSTEM_COLS].ffill().fillna(0.0)
 
-        # Drop rows where we don't have enough history for the first window
         if len(merged) < self.seq_len:
             raise ValueError(f"Not enough data: {len(merged)} rows < seq_len {self.seq_len}")
 
         self.data = merged
         self.timestamps = merged.index
 
-        # Pre-extract arrays for fast access
-        self.price_data = merged[PRICE_COLS].values.astype(np.float32)  # (T, 11)
-        self.system_data = merged[SYSTEM_COLS].values.astype(np.float32)  # (T, 7)
+        self.price_data = merged[PRICE_COLS].values.astype(np.float32)
+        self.system_data = merged[SYSTEM_COLS].values.astype(np.float32)
 
-        # Normalize system conditions for observation (scale to ~[-1, 1] range)
-        # Use simple division by typical magnitudes
+        # Normalize system conditions for observation
         self._system_scales = np.array([
             50000, 50000,  # load
             15000, 15000,  # wind
@@ -199,7 +206,6 @@ class ERCOTBatteryEnv(gym.Env):
             day_mask = self.timestamps.date == d
             day_indices = np.where(day_mask)[0]
             if len(day_indices) >= STEPS_PER_DAY:
-                # Only include full days where we have enough lookback
                 first_idx = day_indices[0]
                 if first_idx >= self.seq_len:
                     self.day_starts.append(first_idx)
@@ -210,7 +216,6 @@ class ERCOTBatteryEnv(gym.Env):
     def _get_time_features(self, idx: int) -> np.ndarray:
         """Compute 6 cyclical time features for a given data index."""
         ts = self.timestamps[idx]
-        # Convert to CPT for ERCOT hour
         if hasattr(ts, 'tz_convert'):
             ts_local = ts.tz_convert("US/Central")
         else:
@@ -232,11 +237,9 @@ class ERCOTBatteryEnv(gym.Env):
 
     def _get_observation(self, idx: int) -> dict:
         """Build observation dict for current step."""
-        # Price history window: (seq_len, 11)
         start = idx - self.seq_len + 1
-        price_history = self.price_data[start:idx + 1].copy()  # (seq_len, 11)
+        price_history = self.price_data[start:idx + 1].copy()
 
-        # Static features: system(7) + time(6) + soc(1) = 14
         system = self.system_data[idx] / self._system_scales
         time_feats = self._get_time_features(idx)
         soc_frac = np.array([self.soc / self.e_max], dtype=np.float32)
@@ -253,17 +256,11 @@ class ERCOTBatteryEnv(gym.Env):
 
         if options and "day_idx" in options:
             self.current_day_idx = options["day_idx"]
-        # else use current day_idx (sequential)
 
         self.current_day_idx = self.current_day_idx % len(self.day_starts)
         self.current_step = 0
-        if self.randomize_initial_soc:
-            frac = self.np_random.uniform(0.20, 0.80)
-            self.soc = frac * self.e_max
-        else:
-            self.soc = self.soc_initial_frac * self.e_max
+        self.soc = self.soc_initial_frac * self.e_max  # fixed at 50% per paper
 
-        # Set data index to start of this day
         self._day_start_idx = self.day_starts[self.current_day_idx]
 
         # Initialize EMA with first RT LMP of the day
@@ -271,10 +268,25 @@ class ERCOTBatteryEnv(gym.Env):
 
         obs = self._get_observation(self._day_start_idx)
 
-        # Advance to next day for next episode
         self.current_day_idx += 1
 
         return obs, {}
+
+    def _parse_action(self, action: np.ndarray):
+        """
+        Parse action array into (mode, energy_mag, [as_mags]).
+
+        Action layout:
+          [:3]  mode one-hot (or soft) — argmax gives hard mode
+          [3]   energy magnitude ∈ (-1, 1) — abs gives [0,1]
+          [4:]  AS magnitudes ∈ (-1, 1) — abs gives [0,1] (co_optimize only)
+        """
+        mode = int(np.argmax(action[:3]))
+        energy_mag = float(np.abs(action[3]))  # always non-negative
+        as_mags = None
+        if self.mode == "co_optimize":
+            as_mags = np.abs(action[4:9])  # [0, 1] each
+        return mode, energy_mag, as_mags
 
     def step(self, action: np.ndarray):
         """
@@ -282,7 +294,7 @@ class ERCOTBatteryEnv(gym.Env):
 
         Parameters
         ----------
-        action : np.ndarray in [-1, 1], shape (1,) or (6,)
+        action : np.ndarray, shape (4,) for energy_only or (9,) for co_optimize
 
         Returns
         -------
@@ -293,14 +305,30 @@ class ERCOTBatteryEnv(gym.Env):
         data_idx = self._day_start_idx + self.current_step
         dt = DELTA_T_HOURS
 
-        # Scale action from [-1, 1] to physical units
-        action = np.clip(action, -1.0, 1.0)
+        mode, energy_mag, as_mags = self._parse_action(action)
 
+        # --- Compute intended p_net from mode + magnitude ---
+        a_S_t = energy_mag * self.p_max  # bid power in MW
+        if mode == MODE_DISCHARGE:
+            v_dch, v_ch = 1.0, 0.0
+            p_net_raw = a_S_t
+        elif mode == MODE_CHARGE:
+            v_dch, v_ch = 0.0, 1.0
+            p_net_raw = -a_S_t
+        else:  # IDLE
+            v_dch, v_ch = 0.0, 0.0
+            p_net_raw = 0.0
+
+        # --- Check SoC violation BEFORE projection (Li et al. termination) ---
+        if p_net_raw >= 0:  # discharging or idle
+            soc_new_raw = self.soc - (p_net_raw / self.eta_dch) * dt
+        else:  # charging
+            soc_new_raw = self.soc + abs(p_net_raw) * self.eta_ch * dt
+
+        soc_violated = soc_new_raw < self.soc_min or soc_new_raw > self.soc_max
+
+        # --- Apply feasibility projection (safety net regardless of violation) ---
         if self.mode == "energy_only":
-            # Scale to [-P_max, P_max]
-            p_net_raw = float(action[0]) * self.p_max
-
-            # Apply feasibility projection
             p_net_t = torch.tensor(p_net_raw, dtype=torch.float32)
             soc_t = torch.tensor(self.soc, dtype=torch.float32)
             p_net_proj = project_energy_only(
@@ -312,53 +340,10 @@ class ERCOTBatteryEnv(gym.Env):
 
             projected_action = np.array([p_net_proj], dtype=np.float32)
 
-            # Compute SoC change
-            if p_net_proj >= 0:  # discharging
-                energy_out = p_net_proj / self.eta_dch * dt
-                self.soc -= energy_out
-            else:  # charging
-                energy_in = abs(p_net_proj) * self.eta_ch * dt
-                self.soc += energy_in
-
-            # Revenue: energy only
-            rt_lmp = self.price_data[data_idx, 0]  # rt_lmp
-            energy_rev = p_net_proj * rt_lmp * dt
-            as_rev = 0.0
-            throughput = abs(p_net_proj) * dt
-            deg_cost = self.degradation_cost * throughput
-
-            # EMA arbitrage bonus (Li et al. Eq 24-26)
-            self.ema_price = self.ema_tau * self.ema_price + (1 - self.ema_tau) * rt_lmp
-            price_diff = abs(rt_lmp - self.ema_price)
-            if p_net_proj > 0 and rt_lmp > self.ema_price:
-                # Discharging when price above EMA — good
-                arbitrage_bonus = self.beta_arb * p_net_proj * price_diff * dt
-            elif p_net_proj < 0 and rt_lmp < self.ema_price:
-                # Charging when price below EMA — good
-                arbitrage_bonus = self.beta_arb * abs(p_net_proj) * price_diff * dt
-            else:
-                arbitrage_bonus = 0.0
-
-            reward = energy_rev + arbitrage_bonus - deg_cost
-
-            info = {
-                "energy_revenue": energy_rev,
-                "as_revenue": 0.0,
-                "arbitrage_bonus": arbitrage_bonus,
-                "degradation_cost": deg_cost,
-                "soc": self.soc,
-                "p_net": p_net_proj,
-                "raw_action": action.copy(),
-                "projected_action": projected_action,
-            }
-
         else:  # co_optimize
-            # Scale: p_net in [-P_max, P_max], AS in [0, P_max]
-            scaled = np.zeros(6, dtype=np.float32)
-            scaled[0] = float(action[0]) * self.p_max  # p_net
-            scaled[1:] = (np.clip(action[1:], 0, 1)) * self.p_max  # AS offers (only positive)
-
-            action_t = torch.tensor(scaled, dtype=torch.float32)
+            as_phys = as_mags * self.p_max  # MW
+            co_action = np.concatenate([[p_net_raw], as_phys])
+            action_t = torch.tensor(co_action, dtype=torch.float32)
             soc_t = torch.tensor(self.soc, dtype=torch.float32)
             proj_t = project_co_optimize(
                 action_t, soc_t,
@@ -370,58 +355,62 @@ class ERCOTBatteryEnv(gym.Env):
             p_net_proj = proj[0]
             projected_action = proj
 
-            # SoC update
-            if p_net_proj >= 0:
-                energy_out = p_net_proj / self.eta_dch * dt
-                self.soc -= energy_out
-            else:
-                energy_in = abs(p_net_proj) * self.eta_ch * dt
-                self.soc += energy_in
+        # --- Update SoC from projected action ---
+        if p_net_proj >= 0:  # discharging
+            energy_out = p_net_proj / self.eta_dch * dt
+            self.soc -= energy_out
+        else:  # charging
+            energy_in = abs(p_net_proj) * self.eta_ch * dt
+            self.soc += energy_in
 
-            # Revenue
-            rt_lmp = self.price_data[data_idx, 0]
-            energy_rev = p_net_proj * rt_lmp * dt
-
-            # AS revenue: capacity * MCPC * dt
-            # RT MCPC indices: 1=regup, 2=regdn, 3=rrs, 4=ecrs, 5=nsrs
-            as_rev = 0.0
-            for i, mcpc_idx in enumerate([1, 2, 3, 4, 5]):
-                as_rev += proj[i + 1] * self.price_data[data_idx, mcpc_idx] * dt
-
-            throughput = abs(p_net_proj) * dt
-            deg_cost = self.degradation_cost * throughput
-
-            # EMA arbitrage bonus (Li et al. Eq 24-26)
-            self.ema_price = self.ema_tau * self.ema_price + (1 - self.ema_tau) * rt_lmp
-            price_diff = abs(rt_lmp - self.ema_price)
-            if p_net_proj > 0 and rt_lmp > self.ema_price:
-                arbitrage_bonus = self.beta_arb * p_net_proj * price_diff * dt
-            elif p_net_proj < 0 and rt_lmp < self.ema_price:
-                arbitrage_bonus = self.beta_arb * abs(p_net_proj) * price_diff * dt
-            else:
-                arbitrage_bonus = 0.0
-
-            reward = energy_rev + as_rev + arbitrage_bonus - deg_cost
-
-            info = {
-                "energy_revenue": energy_rev,
-                "as_revenue": as_rev,
-                "arbitrage_bonus": arbitrage_bonus,
-                "degradation_cost": deg_cost,
-                "soc": self.soc,
-                "p_net": p_net_proj,
-                "raw_action": action.copy(),
-                "projected_action": projected_action,
-            }
-
-        # Clamp SoC (safety — feasibility projection is the primary constraint)
+        # Safety clamp
         self.soc = np.clip(self.soc, self.soc_min, self.soc_max)
+
+        # --- Reward: Li et al. Eq. 26 ---
+        rt_lmp = float(self.price_data[data_idx, 0])
+
+        # EMA update: ρ̄_t = τ * ρ̄_{t-1} + (1-τ) * ρ_t
+        self.ema_price = EMA_TAU * self.ema_price + (1.0 - EMA_TAU) * rt_lmp
+
+        # Direction indicators (Li et al. Eq. 25)
+        # I_dch = sgn(ρ - ρ̄): 1 when price above EMA (good to discharge)
+        # I_ch  = sgn(ρ̄ - ρ): 1 when price below EMA (good to charge)
+        I_dch = np.sign(rt_lmp - self.ema_price)
+        I_ch = np.sign(self.ema_price - rt_lmp)
+
+        price_dev = abs(rt_lmp - self.ema_price)
+
+        # Spot market reward (Eq. 26)
+        # r_S = a_S * ρ * (v_dch * η_dch - v_ch / η_ch) * Δt
+        #     + β_S * a_S * |ρ - ρ̄| * (I_dch * v_dch * η_dch + I_ch * v_ch / η_ch) * Δt
+        #
+        # a_S = energy_mag ∈ [0, 1] p.u. — NOT MW (Li et al. Eq. 26 uses normalized bid)
+        # Δt = 5/60 converts $/h rate to $ per interval
+        #
+        # Checkpoint: energy_mag=1.0, rt_lmp=$100/MWh →
+        #   energy_term = 1.0 × 100 × 0.95 × (5/60) = $7.92  (not $950)
+        energy_term = energy_mag * rt_lmp * (v_dch * self.eta_dch - v_ch / self.eta_ch) * dt
+        timing_bonus = (
+            BETA_ARB * energy_mag * price_dev
+            * (I_dch * v_dch * self.eta_dch + I_ch * v_ch / self.eta_ch) * dt
+        )
+        reward = energy_term + timing_bonus
+
+        # AS revenue (Stage 2 only — not in Stage 1 Eq. 30)
+        as_rev = 0.0
+        if self.mode == "co_optimize":
+            for i, mcpc_idx in enumerate([1, 2, 3, 4, 5]):
+                as_rev += projected_action[i + 1] * float(self.price_data[data_idx, mcpc_idx]) * dt
+            reward += as_rev
+
+        # SoC violation: penalty + termination (Li et al. Section III.D)
+        terminated = False
+        if soc_violated:
+            reward -= SOC_PENALTY
+            terminated = True
 
         # Advance step
         self.current_step += 1
-
-        # Episode ends at day boundary only (288 steps = 1 full day)
-        terminated = False
         truncated = self.current_step >= STEPS_PER_DAY
 
         # Build next observation
@@ -429,6 +418,20 @@ class ERCOTBatteryEnv(gym.Env):
             next_data_idx = self._day_start_idx + self.current_step
             obs = self._get_observation(next_data_idx)
         else:
-            obs = self._get_observation(data_idx)  # terminal obs
+            obs = self._get_observation(data_idx)
+
+        info = {
+            "energy_revenue": float(energy_term),
+            "timing_bonus": float(timing_bonus),
+            "as_revenue": float(as_rev),
+            "soc": float(self.soc),
+            "p_net": float(p_net_proj),
+            "mode": mode,
+            "a_S_t": float(a_S_t),
+            "ema_price": float(self.ema_price),
+            "soc_violated": soc_violated,
+            "raw_action": action.copy(),
+            "projected_action": projected_action,
+        }
 
         return obs, float(reward), terminated, truncated, info

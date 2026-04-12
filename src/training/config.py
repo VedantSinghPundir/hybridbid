@@ -1,5 +1,7 @@
 """
 Hyperparameter configuration for TempDRL training.
+
+Values aligned with Li et al. (2024) Table I where specified.
 """
 
 from dataclasses import dataclass, field
@@ -17,7 +19,7 @@ def _detect_device() -> str:
 
 @dataclass
 class TrainConfig:
-    """Training hyperparameters."""
+    """Base training hyperparameters (Li et al. Table I defaults)."""
 
     # Data
     data_dir: str = "data/processed"
@@ -25,34 +27,34 @@ class TrainConfig:
     n_prices: int = 12
     static_dim: int = 14
 
-    # TTFE
+    # TTFE — Li et al.: N_MHA=2, h=8
     d_model: int = 64
-    nhead: int = 4
+    nhead: int = 8       # paper: 8 heads
     n_layers: int = 2
 
     # Networks
     hidden_dim: int = 256
 
-    # SAC
+    # SAC — Li et al. Table I
     gamma: float = 0.99
-    tau: float = 0.005
+    tau: float = 0.01    # τ_ψ target network smoothing (paper Table I)
 
-    # Numerical stability
+    # Gradient clipping (not in paper, kept as numerical safety)
     max_grad_norm: float = 1.0
-    reward_scale: float = 0.01    # divide raw rewards by ~100
-    price_scale: float = 100.0    # divide raw prices before TTFE
-    alpha_min: float = 0.01       # floor on entropy coefficient
-    randomize_initial_soc: bool = False  # randomize SoC at episode start (20%-80%)
 
-    # Battery
+    # Gumbel-Softmax temperature annealing
+    tau_gumbel_init: float = 1.0   # start temperature
+    tau_gumbel_final: float = 0.1  # end temperature
+
+    # Battery — Li et al. uses η=0.95 for both
     p_max: float = 10.0
     e_max: float = 20.0
     soc_min_frac: float = 0.10
     soc_max_frac: float = 0.90
     soc_initial_frac: float = 0.50
-    eta_ch: float = 0.92
-    eta_dch: float = 0.92
-    degradation_cost: float = 2.0
+    eta_ch: float = 0.95   # paper: 0.95
+    eta_dch: float = 0.95  # paper: 0.95
+    degradation_cost: float = 2.0  # kept for info tracking, not used in step reward
 
     # Device — auto-detect CUDA > MPS > CPU
     device: str = field(default_factory=_detect_device)
@@ -62,15 +64,13 @@ class TrainConfig:
 class Stage1Config(TrainConfig):
     """Stage 1: Energy-only pretraining."""
 
-    randomize_initial_soc: bool = False  # paper uses fixed initial SoC
-
     # Training
     lr_actor: float = 3e-4
-    lr_critic: float = 3e-4
+    lr_critic: float = 1e-4   # v5.2: lowered from 3e-4 to reduce critic gradient spikes
     lr_ttfe: float = 3e-4
     buffer_capacity: int = 1_000_000
     batch_size: int = 256
-    total_steps: int = 500_000
+    total_steps: int = 1_000_000  # v5.2: extended from 500k
     warmup_steps: int = 1000
     updates_per_step: int = 1
 
@@ -81,7 +81,7 @@ class Stage1Config(TrainConfig):
     # Logging / Checkpoint
     log_interval: int = 1_000
     checkpoint_dir: str = "checkpoints/stage1"
-    save_every: int = 50_000
+    save_every: int = 25_000   # v5.2: finer granularity from 50k
 
 
 @dataclass

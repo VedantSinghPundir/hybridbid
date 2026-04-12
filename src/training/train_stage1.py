@@ -26,10 +26,8 @@ def train_stage1(config: Stage1Config = None):
     print(f"Data: {config.train_start} to {config.train_end}")
     print(f"Device: {config.device}")
     print(f"Total steps: {config.total_steps}")
-    print(f"Reward scale: {config.reward_scale}")
-    print(f"Price scale: {config.price_scale}")
     print(f"Max grad norm: {config.max_grad_norm}")
-    print(f"Alpha min: {config.alpha_min}")
+    print(f"τ_gumbel: {config.tau_gumbel_init} → {config.tau_gumbel_final}")
 
     # Create environment
     battery_config = dict(
@@ -45,7 +43,6 @@ def train_stage1(config: Stage1Config = None):
         battery_config=battery_config,
         seq_len=config.seq_len,
         date_range=(config.train_start, config.train_end),
-        randomize_initial_soc=config.randomize_initial_soc,
     )
 
     # Create SAC agent
@@ -67,10 +64,11 @@ def train_stage1(config: Stage1Config = None):
         buffer_capacity=config.buffer_capacity,
         batch_size=config.batch_size,
         max_grad_norm=config.max_grad_norm,
-        reward_scale=config.reward_scale,
-        price_scale=config.price_scale,
-        alpha_min=config.alpha_min,
+        tau_gumbel=config.tau_gumbel_init,
     )
+
+    # Gumbel temperature annealing schedule
+    tau_gumbel_range = config.tau_gumbel_init - config.tau_gumbel_final
 
     # Training loop
     obs, _ = env.reset()
@@ -84,6 +82,7 @@ def train_stage1(config: Stage1Config = None):
     # Rolling metrics for logging
     recent_rewards = []
     recent_socs = []
+    mode_counts = {0: 0, 1: 0, 2: 0}  # charge=0, discharge=1, idle=2
 
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
@@ -97,14 +96,19 @@ def train_stage1(config: Stage1Config = None):
         next_obs, reward, terminated, truncated, info = env.step(action)
         episode_reward += reward
         recent_socs.append(info["soc"])
+        mode_counts[info["mode"]] += 1
 
         # Store transition (done=True only on true termination, not truncation)
         agent.buffer.add(obs, action, reward, next_obs, terminated)
 
+        # Anneal Gumbel temperature
+        frac = min(1.0, step / max(config.total_steps, 1))
+        agent.tau_gumbel = config.tau_gumbel_init - frac * tau_gumbel_range
+
         # Update agent
         metrics = {}
         if step >= config.warmup_steps:
-            metrics = agent.update()
+            metrics = agent.update(tau_gumbel=agent.tau_gumbel)
 
         obs = next_obs
         step += 1
@@ -121,6 +125,18 @@ def train_stage1(config: Stage1Config = None):
             steps_per_sec = step / elapsed if elapsed > 0 else 0
             avg_reward = np.mean(recent_rewards[-10:]) if recent_rewards else 0
             avg_soc = np.mean(recent_socs[-288:]) if recent_socs else 0
+
+            # Mode distribution over the logging window
+            total_modes = sum(mode_counts.values())
+            if total_modes > 0:
+                mode_pct_charge = 100.0 * mode_counts[0] / total_modes
+                mode_pct_discharge = 100.0 * mode_counts[1] / total_modes
+                mode_pct_idle = 100.0 * mode_counts[2] / total_modes
+            else:
+                mode_pct_charge = mode_pct_discharge = mode_pct_idle = 0.0
+            mode_counts = {0: 0, 1: 0, 2: 0}  # reset window
+
+            gumbel_temperature = agent.tau_gumbel
 
             # Check for NaN
             has_nan = any(
@@ -139,6 +155,8 @@ def train_stage1(config: Stage1Config = None):
                 f"grad_c={metrics.get('critic_grad_norm', 0):.3f} | "
                 f"grad_a={metrics.get('actor_grad_norm', 0):.3f} | "
                 f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} | "
+                f"mode=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] | "
+                f"tau_g={gumbel_temperature:.3f} | "
                 f"{steps_per_sec:.1f} steps/s{nan_flag}",
                 flush=True,
             )
