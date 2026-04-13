@@ -27,6 +27,7 @@ def train_stage1(config: Stage1Config = None):
     print(f"Device: {config.device}")
     print(f"Total steps: {config.total_steps}")
     print(f"Max grad norm: {config.max_grad_norm}")
+    print(f"LR: actor={config.lr_actor} critic={config.lr_critic} ttfe={config.lr_ttfe}")
     print(f"τ_gumbel: {config.tau_gumbel_init} → {config.tau_gumbel_final}")
 
     # Create environment
@@ -84,6 +85,9 @@ def train_stage1(config: Stage1Config = None):
     recent_socs = []
     mode_counts = {0: 0, 1: 0, 2: 0}  # charge=0, discharge=1, idle=2
 
+    # Last-good-state snapshot for NaN recovery
+    prev_snapshot = None
+
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
     print(f"Warming up for {config.warmup_steps} steps...")
@@ -108,7 +112,29 @@ def train_stage1(config: Stage1Config = None):
         # Update agent
         metrics = {}
         if step >= config.warmup_steps:
+            # Snapshot state every 100 steps for NaN recovery
+            if step % 100 == 0:
+                prev_snapshot = agent.snapshot_state()
+
             metrics = agent.update(tau_gumbel=agent.tau_gumbel)
+
+            # NaN guard: check if update() detected NaN in parameters
+            if metrics.get("nan_detected"):
+                nan_source = metrics.get("nan_source", "unknown")
+                print(
+                    f"\nFATAL: NaN detected in {nan_source} at step {step}.",
+                    flush=True,
+                )
+                if prev_snapshot is not None:
+                    emergency_path = os.path.join(
+                        config.checkpoint_dir,
+                        f"emergency_pre_nan_step{step}.pt",
+                    )
+                    agent.save_emergency_checkpoint(emergency_path, prev_snapshot)
+                    print(f"  Emergency checkpoint (last good state) saved: {emergency_path}")
+                else:
+                    print("  No previous snapshot available for emergency save.")
+                return agent, recent_rewards
 
         obs = next_obs
         step += 1
@@ -138,7 +164,7 @@ def train_stage1(config: Stage1Config = None):
 
             gumbel_temperature = agent.tau_gumbel
 
-            # Check for NaN
+            # Check for NaN in metrics values (belt-and-suspenders with param check)
             has_nan = any(
                 np.isnan(v) for v in metrics.values() if isinstance(v, float)
             )
@@ -152,9 +178,11 @@ def train_stage1(config: Stage1Config = None):
                 f"alpha={metrics.get('alpha', 0):.4f} | "
                 f"avg_reward={avg_reward:.1f} | "
                 f"avg_soc={avg_soc:.2f} | "
-                f"grad_c={metrics.get('critic_grad_norm', 0):.3f} | "
+                f"grad_c={metrics.get('critic_grad_norm', 0):.3f} "
+                f"[q1={metrics.get('grad_q1', 0):.1f} q2={metrics.get('grad_q2', 0):.1f}] | "
                 f"grad_a={metrics.get('actor_grad_norm', 0):.3f} | "
-                f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} | "
+                f"grad_t={metrics.get('ttfe_grad_norm', 0):.3f} "
+                f"[proj={metrics.get('grad_ttfe_proj', 0):.1f} attn={metrics.get('grad_ttfe_attn', 0):.1f}] | "
                 f"mode=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] | "
                 f"tau_g={gumbel_temperature:.3f} | "
                 f"{steps_per_sec:.1f} steps/s{nan_flag}",
@@ -163,8 +191,12 @@ def train_stage1(config: Stage1Config = None):
 
             if has_nan:
                 print("FATAL: NaN detected in metrics. Saving emergency checkpoint and stopping.")
-                emergency_path = os.path.join(config.checkpoint_dir, f"emergency_step{step}.pt")
-                agent.save_checkpoint(emergency_path)
+                if prev_snapshot is not None:
+                    emergency_path = os.path.join(
+                        config.checkpoint_dir, f"emergency_step{step}.pt"
+                    )
+                    agent.save_emergency_checkpoint(emergency_path, prev_snapshot)
+                    print(f"  Emergency checkpoint saved: {emergency_path}")
                 return agent, []
 
             # Clear old SoC history to avoid memory growth

@@ -5,7 +5,7 @@ import tempfile
 import numpy as np
 import torch
 import pytest
-from src.models.sac import SACAgent
+from src.models.sac import SACAgent, has_nan_params
 from src.models.networks import Actor
 
 
@@ -141,6 +141,63 @@ class TestCheckpoint:
             assert torch.allclose(agent2.actor.fc1.weight.data, agent.actor.fc1.weight.data)
         finally:
             os.unlink(path)
+
+
+class TestNaNGuard:
+    def test_has_nan_params_clean(self):
+        """Clean model should not trigger NaN detection."""
+        model = torch.nn.Linear(10, 5)
+        found, name = has_nan_params(model)
+        assert not found
+        assert name is None
+
+    def test_has_nan_params_nan_weight(self):
+        """NaN in weight should be detected."""
+        model = torch.nn.Linear(10, 5)
+        with torch.no_grad():
+            model.weight[0, 0] = float("nan")
+        found, name = has_nan_params(model)
+        assert found
+        assert name == "weight"
+
+    def test_has_nan_params_inf_bias(self):
+        """Inf in bias should be detected."""
+        model = torch.nn.Linear(10, 5)
+        with torch.no_grad():
+            model.bias[2] = float("inf")
+        found, name = has_nan_params(model)
+        assert found
+        assert name == "bias"
+
+    def test_snapshot_and_emergency_save(self):
+        """snapshot_state + save_emergency_checkpoint roundtrip."""
+        agent = SACAgent(stage=1, device="cpu")
+        snapshot = agent.snapshot_state()
+
+        # Corrupt the agent
+        with torch.no_grad():
+            agent.actor.fc1.weight.fill_(float("nan"))
+
+        with tempfile.NamedTemporaryFile(suffix=".pt", delete=False) as f:
+            path = f.name
+        try:
+            agent.save_emergency_checkpoint(path, snapshot)
+            ckpt = torch.load(path, map_location="cpu", weights_only=True)
+            # Emergency checkpoint should have clean (pre-corruption) weights
+            assert not torch.isnan(ckpt["actor"]["fc1.weight"]).any()
+        finally:
+            os.unlink(path)
+
+    def test_update_returns_component_grads(self):
+        """update() should return per-component gradient norms."""
+        agent = SACAgent(stage=1, device="cpu", buffer_capacity=200, batch_size=16)
+        for _ in range(50):
+            agent.buffer.add(_make_obs(), np.random.randn(4).astype(np.float32),
+                             1.0, _make_obs(), False)
+        metrics = agent.update()
+        for key in ["grad_q1", "grad_q2", "grad_ttfe_proj", "grad_ttfe_attn"]:
+            assert key in metrics, f"Missing metric: {key}"
+            assert isinstance(metrics[key], float)
 
 
 class TestStage2InitFromStage1:

@@ -66,7 +66,7 @@ class Stage1Config(TrainConfig):
 
     # Training
     lr_actor: float = 3e-4
-    lr_critic: float = 1e-4   # v5.2: lowered from 3e-4 to reduce critic gradient spikes
+    lr_critic: float = 3e-4   # v5.3: reverted from 1e-4 — lower LR worsened mode collapse in v5.2
     lr_ttfe: float = 3e-4
     buffer_capacity: int = 1_000_000
     batch_size: int = 256

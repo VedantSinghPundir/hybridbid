@@ -19,6 +19,22 @@ from src.models.networks import Actor, TwinCritic
 from src.models.replay_buffer import ReplayBuffer
 
 
+def has_nan_params(model):
+    """Check if any parameter in model contains NaN or Inf."""
+    for name, param in model.named_parameters():
+        if param.requires_grad and (torch.isnan(param).any() or torch.isinf(param).any()):
+            return True, name
+    return False, None
+
+
+def _grad_norm(params):
+    """Compute L2 gradient norm for a list of parameters (pre-clip)."""
+    grads = [p.grad.detach().flatten() for p in params if p.grad is not None]
+    if not grads:
+        return 0.0
+    return torch.cat(grads).norm().item()
+
+
 class SACAgent:
     """
     SAC agent encapsulating TTFE + Actor + TwinCritic + target networks.
@@ -201,10 +217,18 @@ class SACAgent:
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
+        # Per-component grad norms (pre-clip)
+        grad_q1 = _grad_norm(self.critic.q1.parameters())
+        grad_q2 = _grad_norm(self.critic.q2.parameters())
         critic_grad_norm = nn.utils.clip_grad_norm_(
             self.critic.parameters(), self.max_grad_norm
         )
         self.critic_optimizer.step()
+
+        # NaN check: critic
+        nan_found, nan_name = has_nan_params(self.critic)
+        if nan_found:
+            return {"nan_detected": True, "nan_source": f"critic.{nan_name}"}
 
         # --- Actor update ---
         new_actions, log_probs, _ = self.actor.sample(
@@ -221,6 +245,11 @@ class SACAgent:
         )
         self.actor_optimizer.step()
 
+        # NaN check: actor
+        nan_found, nan_name = has_nan_params(self.actor)
+        if nan_found:
+            return {"nan_detected": True, "nan_source": f"actor.{nan_name}"}
+
         # --- TTFE update (via critic gradients) ---
         obs_encoded_ttfe = self._encode_obs(ph, sf)
         q1_ttfe, q2_ttfe = self.critic(obs_encoded_ttfe, actions)
@@ -228,10 +257,20 @@ class SACAgent:
 
         self.ttfe_optimizer.zero_grad()
         ttfe_loss.backward()
+        # Per-component grad norms (pre-clip)
+        grad_ttfe_proj = _grad_norm(
+            [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
+        )
+        grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
         ttfe_grad_norm = nn.utils.clip_grad_norm_(
             self.ttfe.parameters(), self.max_grad_norm
         )
         self.ttfe_optimizer.step()
+
+        # NaN check: TTFE
+        nan_found, nan_name = has_nan_params(self.ttfe)
+        if nan_found:
+            return {"nan_detected": True, "nan_source": f"ttfe.{nan_name}"}
 
         # --- Alpha update ---
         alpha_loss = -(self.log_alpha * (log_probs.detach() + self.target_entropy)).mean()
@@ -252,6 +291,10 @@ class SACAgent:
             "critic_grad_norm": critic_grad_norm.item(),
             "actor_grad_norm": actor_grad_norm.item(),
             "ttfe_grad_norm": ttfe_grad_norm.item(),
+            "grad_q1": grad_q1,
+            "grad_q2": grad_q2,
+            "grad_ttfe_proj": grad_ttfe_proj,
+            "grad_ttfe_attn": grad_ttfe_attn,
         }
 
     def _soft_update(self):
@@ -259,6 +302,24 @@ class SACAgent:
         for p, p_target in zip(self.critic.parameters(), self.critic_target.parameters()):
             p_target.data.mul_(1.0 - self.tau)
             p_target.data.add_(self.tau * p.data)
+
+    def snapshot_state(self):
+        """Return cloned state dicts for emergency recovery. ~1.6MB, <1ms on GPU."""
+        return {
+            "ttfe": {k: v.clone() for k, v in self.ttfe.state_dict().items()},
+            "actor": {k: v.clone() for k, v in self.actor.state_dict().items()},
+            "critic": {k: v.clone() for k, v in self.critic.state_dict().items()},
+            "critic_target": {k: v.clone() for k, v in self.critic_target.state_dict().items()},
+            "log_alpha": self.log_alpha.data.clone(),
+        }
+
+    def save_emergency_checkpoint(self, path: str, snapshot: dict):
+        """Save an emergency checkpoint from a previous good state snapshot."""
+        torch.save({
+            "stage": self.stage,
+            "tau_gumbel": self.tau_gumbel,
+            **snapshot,
+        }, path)
 
     def save_checkpoint(self, path: str):
         """Save all model weights and optimizer states."""
