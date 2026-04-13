@@ -213,7 +213,9 @@ class SACAgent:
             td_target = rewards + (1.0 - dones) * self.gamma * q_target
 
         q1, q2 = self.critic(obs_encoded.detach(), actions)
-        critic_loss = F.mse_loss(q1, td_target) + F.mse_loss(q2, td_target)
+        # Huber loss (smooth L1) instead of MSE: quadratic for small TD errors,
+        # linear for large ones — directly reduces gradient magnitude from outlier batches.
+        critic_loss = F.huber_loss(q1, td_target) + F.huber_loss(q2, td_target)
 
         self.critic_optimizer.zero_grad()
         critic_loss.backward()
@@ -253,19 +255,28 @@ class SACAgent:
         # --- TTFE update (via critic gradients) ---
         obs_encoded_ttfe = self._encode_obs(ph, sf)
         q1_ttfe, q2_ttfe = self.critic(obs_encoded_ttfe, actions)
-        ttfe_loss = -(q1_ttfe.mean() + q2_ttfe.mean()) * 0.5
 
-        self.ttfe_optimizer.zero_grad()
-        ttfe_loss.backward()
-        # Per-component grad norms (pre-clip)
-        grad_ttfe_proj = _grad_norm(
-            [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
-        )
-        grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
-        ttfe_grad_norm = nn.utils.clip_grad_norm_(
-            self.ttfe.parameters(), self.max_grad_norm
-        )
-        self.ttfe_optimizer.step()
+        # Q-value guard: if critic activations overflowed (inf/NaN), skip TTFE
+        # update entirely. The critic weights may be finite while its outputs are
+        # not (large activations overflow in fp32). This breaks the NaN propagation
+        # path that caused the v5.3 crash (ttfe.pos_embedding NaN at step 79k).
+        q_vals_ok = (torch.isfinite(q1_ttfe).all() and torch.isfinite(q2_ttfe).all())
+        if q_vals_ok:
+            ttfe_loss = -(q1_ttfe.mean() + q2_ttfe.mean()) * 0.5
+            self.ttfe_optimizer.zero_grad()
+            ttfe_loss.backward()
+            # Per-component grad norms (pre-clip)
+            grad_ttfe_proj = _grad_norm(
+                [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
+            )
+            grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
+            ttfe_grad_norm = nn.utils.clip_grad_norm_(
+                self.ttfe.parameters(), self.max_grad_norm
+            )
+            self.ttfe_optimizer.step()
+        else:
+            ttfe_grad_norm = torch.tensor(0.0)
+            grad_ttfe_proj = grad_ttfe_attn = 0.0
 
         # NaN check: TTFE
         nan_found, nan_name = has_nan_params(self.ttfe)
