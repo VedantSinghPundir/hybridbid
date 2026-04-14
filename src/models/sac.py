@@ -232,53 +232,41 @@ class SACAgent:
         if nan_found:
             return {"nan_detected": True, "nan_source": f"critic.{nan_name}"}
 
-        # --- Actor update ---
+        # --- Actor + TTFE update ---
+        # obs_encoded retains the TTFE computation graph (not detached above).
+        # TTFE is updated here via actor loss — NOT via critic loss. This removes
+        # the amplification path: TTFE → critic → Q-values → (critic weights × Q)
+        # → TTFE gradient, which grew to 314T in v5.4 as critic weights accumulated.
+        # Actor gradient to TTFE is small (~0.5-1.4 norm, observed) and does not
+        # scale with Q-value magnitude.
         new_actions, log_probs, _ = self.actor.sample(
-            obs_encoded.detach(), tau=tau_gumbel, hard=False
+            obs_encoded, tau=tau_gumbel, hard=False
         )
+        # Detach obs before critic so critic state weights don't amplify TTFE grad.
         q1_new, q2_new = self.critic(obs_encoded.detach(), new_actions)
         q_new = torch.min(q1_new, q2_new)
         actor_loss = (self.alpha * log_probs - q_new).mean()
 
         self.actor_optimizer.zero_grad()
+        self.ttfe_optimizer.zero_grad()
         actor_loss.backward()
         actor_grad_norm = nn.utils.clip_grad_norm_(
             self.actor.parameters(), self.max_grad_norm
         )
+        grad_ttfe_proj = _grad_norm(
+            [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
+        )
+        grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
+        ttfe_grad_norm = nn.utils.clip_grad_norm_(
+            self.ttfe.parameters(), self.max_grad_norm
+        )
         self.actor_optimizer.step()
+        self.ttfe_optimizer.step()
 
-        # NaN check: actor
+        # NaN check: actor + TTFE
         nan_found, nan_name = has_nan_params(self.actor)
         if nan_found:
             return {"nan_detected": True, "nan_source": f"actor.{nan_name}"}
-
-        # --- TTFE update (via critic gradients) ---
-        obs_encoded_ttfe = self._encode_obs(ph, sf)
-        q1_ttfe, q2_ttfe = self.critic(obs_encoded_ttfe, actions)
-
-        # Q-value guard: if critic activations overflowed (inf/NaN), skip TTFE
-        # update entirely. The critic weights may be finite while its outputs are
-        # not (large activations overflow in fp32). This breaks the NaN propagation
-        # path that caused the v5.3 crash (ttfe.pos_embedding NaN at step 79k).
-        q_vals_ok = (torch.isfinite(q1_ttfe).all() and torch.isfinite(q2_ttfe).all())
-        if q_vals_ok:
-            ttfe_loss = -(q1_ttfe.mean() + q2_ttfe.mean()) * 0.5
-            self.ttfe_optimizer.zero_grad()
-            ttfe_loss.backward()
-            # Per-component grad norms (pre-clip)
-            grad_ttfe_proj = _grad_norm(
-                [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
-            )
-            grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
-            ttfe_grad_norm = nn.utils.clip_grad_norm_(
-                self.ttfe.parameters(), self.max_grad_norm
-            )
-            self.ttfe_optimizer.step()
-        else:
-            ttfe_grad_norm = torch.tensor(0.0)
-            grad_ttfe_proj = grad_ttfe_attn = 0.0
-
-        # NaN check: TTFE
         nan_found, nan_name = has_nan_params(self.ttfe)
         if nan_found:
             return {"nan_detected": True, "nan_source": f"ttfe.{nan_name}"}
