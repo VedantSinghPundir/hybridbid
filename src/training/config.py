@@ -37,7 +37,7 @@ class TrainConfig:
 
     # SAC — Li et al. Table I
     gamma: float = 0.99
-    tau: float = 0.01    # τ_ψ target network smoothing (paper Table I)
+    tau: float = 0.005   # τ_ψ target network smoothing (standard SAC default; 0.01 tracks volatile critic too closely under heavy-tailed rewards)
 
     # Gradient clipping (not in paper, kept as numerical safety)
     max_grad_norm: float = 1.0

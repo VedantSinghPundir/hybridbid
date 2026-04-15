@@ -42,10 +42,10 @@ class TestSACConstruction:
         ttfe_layer = agent.ttfe.transformer.layers[0]
         assert ttfe_layer.self_attn.num_heads == 8
 
-    def test_tau_default_is_0_01(self):
-        """Paper Table I specifies τ_ψ=0.01 for target network."""
+    def test_tau_default_is_0_005(self):
+        """τ_ψ=0.005 (standard SAC default; halved from paper's 0.01 for stability under heavy-tailed ERCOT rewards)."""
         agent = SACAgent(stage=1, device="cpu")
-        assert agent.tau == 0.01
+        assert agent.tau == 0.005
 
 
 class TestSelectAction:

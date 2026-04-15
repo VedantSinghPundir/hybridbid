@@ -64,7 +64,7 @@ class SACAgent:
         lr_critic: float = 3e-4,
         lr_ttfe: float = 3e-4,
         gamma: float = 0.99,
-        tau: float = 0.01,
+        tau: float = 0.005,
         buffer_capacity: int = None,
         batch_size: int = None,
         max_grad_norm: float = 1.0,
@@ -204,12 +204,8 @@ class SACAgent:
         next_sf = batch["next_static_features"]
         dones = batch["dones"]
 
-        # Clip per-step rewards to prevent ERCOT price spikes (e.g. Feb 2021 storm,
-        # $9000/MWh × β_S=10 → reward ~7800) from causing critic weight explosion.
-        # ±1000 preserves the full signal for 99%+ of ERCOT intervals (normal range
-        # $20–$2,000/MWh) while bounding Uri-scale extremes.
-        # Q* cap ≈ 1000/0.01 = 100k, still bounded.
-        rewards = rewards.clamp(-1000.0, 1000.0)
+        # Rewards are symlog-transformed before entering the replay buffer
+        # (see train_stage1.py). No clipping needed here.
 
         # Encode observations
         obs_encoded = self._encode_obs(ph, sf)

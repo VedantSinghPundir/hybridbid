@@ -9,9 +9,21 @@ import os
 import sys
 import time
 
+import math
+
 import numpy as np
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
+
+
+def symlog(x: float) -> float:
+    """DreamerV3 symmetric logarithmic transform (Hafner et al., 2023, arXiv:2301.04104).
+
+    Compresses large reward magnitudes while preserving sign and ordering.
+    symlog(0)=0, symlog(1)≈0.69, symlog(100)≈4.62, symlog(9000)≈9.10.
+    Applied to the economic reward component only (NOT to the SoC penalty).
+    """
+    return math.copysign(math.log1p(abs(x)), x)
 
 from src.env.ercot_env import ERCOTBatteryEnv
 from src.models.sac import SACAgent
@@ -73,7 +85,8 @@ def train_stage1(config: Stage1Config = None):
 
     # Training loop
     obs, _ = env.reset()
-    episode_reward = 0.0
+    episode_reward = 0.0      # symlog-transformed (what the agent trains on)
+    episode_raw_reward = 0.0  # pre-symlog (for comparison with v5.7/v5.8)
     episode_count = 0
     step = 0
     log_interval = config.log_interval
@@ -81,7 +94,8 @@ def train_stage1(config: Stage1Config = None):
     t_start = time.time()
 
     # Rolling metrics for logging
-    recent_rewards = []
+    recent_rewards = []      # symlog-transformed episode totals
+    recent_raw_rewards = []  # pre-symlog episode totals
     recent_socs = []
     mode_counts = {0: 0, 1: 0, 2: 0}  # charge=0, discharge=1, idle=2
 
@@ -98,12 +112,21 @@ def train_stage1(config: Stage1Config = None):
 
         # Step environment
         next_obs, reward, terminated, truncated, info = env.step(action)
-        episode_reward += reward
+
+        # Apply symlog to economic reward component; keep SoC penalty at original scale.
+        # symlog compresses ERCOT's heavy-tailed price distribution (Cauchy residuals,
+        # Uri storm $9k/MWh) without destroying reward ordering. DreamerV3 (Hafner 2023).
+        soc_penalty = -50.0 if info["soc_violated"] else 0.0
+        raw_econ = info["energy_revenue"] + info["timing_bonus"]
+        transformed_reward = symlog(raw_econ) + soc_penalty
+
+        episode_reward += transformed_reward
+        episode_raw_reward += reward  # original env reward (pre-symlog) for logging
         recent_socs.append(info["soc"])
         mode_counts[info["mode"]] += 1
 
-        # Store transition (done=True only on true termination, not truncation)
-        agent.buffer.add(obs, action, reward, next_obs, terminated)
+        # Store symlog-transformed reward in replay buffer
+        agent.buffer.add(obs, action, transformed_reward, next_obs, terminated)
 
         # Anneal Gumbel temperature
         frac = min(1.0, step / max(config.total_steps, 1))
@@ -142,7 +165,9 @@ def train_stage1(config: Stage1Config = None):
         if terminated or truncated:
             episode_count += 1
             recent_rewards.append(episode_reward)
+            recent_raw_rewards.append(episode_raw_reward)
             episode_reward = 0.0
+            episode_raw_reward = 0.0
             obs, _ = env.reset()
 
         # Logging
@@ -150,6 +175,7 @@ def train_stage1(config: Stage1Config = None):
             elapsed = time.time() - t_start
             steps_per_sec = step / elapsed if elapsed > 0 else 0
             avg_reward = np.mean(recent_rewards[-10:]) if recent_rewards else 0
+            avg_raw_reward = np.mean(recent_raw_rewards[-10:]) if recent_raw_rewards else 0
             avg_soc = np.mean(recent_socs[-288:]) if recent_socs else 0
 
             # Mode distribution over the logging window
@@ -177,6 +203,7 @@ def train_stage1(config: Stage1Config = None):
                 f"actor={metrics.get('actor_loss', 0):.4f} | "
                 f"alpha={metrics.get('alpha', 0):.4f} | "
                 f"avg_reward={avg_reward:.1f} | "
+                f"avg_raw_reward={avg_raw_reward:.1f} | "
                 f"avg_soc={avg_soc:.2f} | "
                 f"grad_c={metrics.get('critic_grad_norm', 0):.3f} "
                 f"[q1={metrics.get('grad_q1', 0):.1f} q2={metrics.get('grad_q2', 0):.1f}] | "
