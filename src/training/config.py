@@ -86,29 +86,35 @@ class Stage1Config(TrainConfig):
 
 @dataclass
 class Stage2Config(TrainConfig):
-    """Stage 2: Co-optimization finetuning."""
+    """Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v1)."""
 
     # Training
     lr_actor: float = 3e-4
     lr_critic: float = 3e-4
-    lr_ttfe: float = 3e-5  # 10x lower for TTFE
-    buffer_capacity: int = 50_000
-    batch_size: int = 128
-    total_steps: int = 30_000
-    warmup_steps: int = 500
+    lr_ttfe: float = 3e-5   # 10× lower for TTFE unfreezing phases
+    buffer_capacity: int = 60_000
+    batch_size: int = 256
+    total_steps: int = 150_000
+    warmup_steps: int = 5_000
     updates_per_step: int = 1
 
-    # Progressive unfreezing
-    phase1_steps: int = 10_000  # Frozen TTFE
-    phase2_steps: int = 20_000  # Unfreeze top layers
+    # Gumbel temperature — start warmer than scratch (pretrained mode head)
+    tau_gumbel_init: float = 0.5   # override base (Stage 1 used 1.0)
+    tau_gumbel_final: float = 0.1
 
-    # Data range
+    # Progressive TTFE unfreezing phase boundaries (fractions of total_steps)
+    phase_b_start_frac: float = 0.30   # Phase A: 0–30% frozen TTFE
+    phase_c_start_frac: float = 0.60   # Phase B: 30–60% unfreeze top layer
+                                        # Phase C: 60–100% unfreeze all TTFE
+
+    # Data range — post-RTC+B train; test = March 2026 (held out)
     train_start: str = "2025-12-05"
-    train_end: str = "2026-01-31"
+    train_end: str = "2026-02-28"
 
-    # Stage 1 checkpoint
-    stage1_checkpoint: str = "checkpoints/stage1/checkpoint.pt"
+    # Stage 1 best checkpoint (v5.9 300k, $267/day)
+    stage1_checkpoint: str = "checkpoints/stage1/checkpoint_step300000.pt"
 
-    # Checkpoint
+    # Logging / Checkpoint
+    log_interval: int = 1_000
     checkpoint_dir: str = "checkpoints/stage2"
-    save_every: int = 10_000
+    save_every: int = 5_000

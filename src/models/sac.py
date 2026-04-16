@@ -177,7 +177,12 @@ class SACAgent:
 
         return action.squeeze(0).cpu().numpy()
 
-    def update(self, batch: dict = None, tau_gumbel: float = None) -> dict:
+    def update(
+        self,
+        batch: dict = None,
+        tau_gumbel: float = None,
+        phase: str = "A",
+    ) -> dict:
         """
         Perform one SAC update step.
 
@@ -185,6 +190,10 @@ class SACAgent:
         ----------
         tau_gumbel : float, optional
             Override Gumbel temperature for this update. Uses self.tau_gumbel if None.
+        phase : str
+            Training phase ('A', 'B', 'C'). Phase C applies tighter critic gradient
+            clipping (max_norm=0.5) and TTFE gradient scaling (×0.1) to stabilize
+            the freshly-unfrozen TTFE against a not-yet-mature critic.
 
         Returns dict of losses/metrics.
         """
@@ -231,8 +240,10 @@ class SACAgent:
         # Per-component grad norms (pre-clip)
         grad_q1 = _grad_norm(self.critic.q1.parameters())
         grad_q2 = _grad_norm(self.critic.q2.parameters())
+        # Phase C: tighter critic clipping — fresh TTFE can amplify TD errors
+        critic_clip_norm = 0.5 if phase == "C" else self.max_grad_norm
         critic_grad_norm = nn.utils.clip_grad_norm_(
-            self.critic.parameters(), self.max_grad_norm
+            self.critic.parameters(), critic_clip_norm
         )
         self.critic_optimizer.step()
 
@@ -266,6 +277,11 @@ class SACAgent:
             [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
         )
         grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
+        # Phase C: additional 10× TTFE gradient damping (belt-and-suspenders with 3e-5 lr)
+        if phase == "C":
+            for p in self.ttfe.parameters():
+                if p.grad is not None:
+                    p.grad *= 0.1
         ttfe_grad_norm = nn.utils.clip_grad_norm_(
             self.ttfe.parameters(), self.max_grad_norm
         )
@@ -398,3 +414,9 @@ class SACAgent:
         unfrozen = [p for p in self.ttfe.parameters() if p.requires_grad]
         if unfrozen:
             self.ttfe_optimizer = torch.optim.Adam(unfrozen, lr=lr)
+
+    def unfreeze_ttfe_all(self, lr: float = 3e-5):
+        """Unfreeze all TTFE parameters (for Stage 2 Phase C)."""
+        for p in self.ttfe.parameters():
+            p.requires_grad = True
+        self.ttfe_optimizer = torch.optim.Adam(self.ttfe.parameters(), lr=lr)
