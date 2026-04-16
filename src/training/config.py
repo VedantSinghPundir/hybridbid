@@ -86,7 +86,15 @@ class Stage1Config(TrainConfig):
 
 @dataclass
 class Stage2Config(TrainConfig):
-    """Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v1)."""
+    """Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v2).
+
+    Key changes from v1:
+      - target_entropy corrected to 5.0 in SACAgent (9D action space)
+      - Alpha floor at 0.05 (log_alpha.clamp_(min=log(0.05)))
+      - Phase C removed — two-phase only (A: 0–40%, B: 40–100%)
+      - Gumbel τ: 0.8→0.5 in Phase A, hold 0.5 in Phase B
+      - Total steps reduced from 150k to 120k (Phase C consumed wasted steps)
+    """
 
     # Training
     lr_actor: float = 3e-4
@@ -94,18 +102,17 @@ class Stage2Config(TrainConfig):
     lr_ttfe: float = 3e-5   # 10× lower for TTFE unfreezing phases
     buffer_capacity: int = 60_000
     batch_size: int = 256
-    total_steps: int = 150_000
+    total_steps: int = 120_000
     warmup_steps: int = 5_000
     updates_per_step: int = 1
 
-    # Gumbel temperature — start warmer than scratch (pretrained mode head)
-    tau_gumbel_init: float = 0.5   # override base (Stage 1 used 1.0)
-    tau_gumbel_final: float = 0.1
+    # Gumbel temperature — higher start encourages mode exploration while AS heads learn
+    tau_gumbel_init: float = 0.8   # Phase A start; anneals to 0.5 at Phase A end
+    tau_gumbel_final: float = 0.5  # Phase B holds at 0.5 (no further annealing)
 
-    # Progressive TTFE unfreezing phase boundaries (fractions of total_steps)
-    phase_b_start_frac: float = 0.30   # Phase A: 0–30% frozen TTFE
-    phase_c_start_frac: float = 0.60   # Phase B: 30–60% unfreeze top layer
-                                        # Phase C: 60–100% unfreeze all TTFE
+    # Two-phase TTFE unfreezing (Phase C removed — destabilized pretrained representations)
+    phase_b_start_frac: float = 0.40   # Phase A: 0–40% frozen TTFE (steps 0–47999)
+                                        # Phase B: 40–100% unfreeze top layer (steps 48000–119999)
 
     # Data range — post-RTC+B train; test = March 2026 (held out)
     train_start: str = "2025-12-05"
@@ -116,5 +123,5 @@ class Stage2Config(TrainConfig):
 
     # Logging / Checkpoint
     log_interval: int = 1_000
-    checkpoint_dir: str = "checkpoints/stage2"
+    checkpoint_dir: str = "checkpoints/stage2_v2"
     save_every: int = 5_000

@@ -1,5 +1,5 @@
 """
-Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v1).
+Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v2).
 
 Pretrain→finetune: loads Stage 1 v5.9 300k checkpoint, expands action space
 to 9D (energy + 5 AS products), trains on Dec 2025–Feb 2026 data only.
@@ -7,9 +7,17 @@ to 9D (energy + 5 AS products), trains on Dec 2025–Feb 2026 data only.
 Key differences from Stage 1:
   - Action space: 9D (3 mode + 1 energy_mag + 5 AS fractions)
   - Reward: symlog(energy_revenue + timing_bonus + as_revenue) + soc_penalty
-  - TTFE: progressive unfreezing (Phase A frozen → B top layer → C all)
+  - TTFE: two-phase unfreezing (Phase A frozen → B top layer only; Phase C removed)
   - Fresh critic (Stage 1 Q-values invalid for new reward structure)
   - Smaller replay buffer (60k) matched to post-RTC+B data volume
+
+Changes from v1:
+  - target_entropy corrected to 5.0 in SACAgent (9D action space; was log(3) ≈ 1.099)
+  - Alpha floor at log(0.05) prevents collapse even if target_entropy undershoots
+  - Phase C removed entirely (full TTFE unfreeze eroded pretrained representations)
+  - Phase A extended to 40% (was 30%) for more critic maturity before TTFE unfreezing
+  - Gumbel τ: 0.8→0.5 in Phase A, holds at 0.5 through Phase B (was 0.5→0.1 globally)
+  - Total steps: 120k (was 150k; Phase C consumed 60k wasted steps)
 """
 
 import argparse
@@ -35,22 +43,24 @@ def symlog(x: float) -> float:
     return math.copysign(math.log1p(abs(x)), x)
 
 
-def train_stage2(config: Stage2Config = None):
+def train_stage2(config: Stage2Config = None, scratch: bool = False):
     if config is None:
         config = Stage2Config()
 
+    run_label = "stage2_scratch" if scratch else "stage2_v2"
     phase_b_step = int(config.total_steps * config.phase_b_start_frac)
-    phase_c_step = int(config.total_steps * config.phase_c_start_frac)
 
-    print(f"=== Stage 2: Co-Optimization Fine-Tuning (stage2_v1) ===")
+    print(f"=== Stage 2: Co-Optimization Fine-Tuning ({run_label}) ===")
+    print(f"Initialization:    {'SCRATCH (no pretrained weights)' if scratch else 'Stage 1 v5.9 300k pretrained'}")
     print(f"Data:              {config.train_start} → {config.train_end}")
     print(f"Stage 1 ckpt:      {config.stage1_checkpoint}")
     print(f"Device:            {config.device}")
     print(f"Total steps:       {config.total_steps}")
-    print(f"Phase A (frozen):  0 → {phase_b_step}")
-    print(f"Phase B (top-1):   {phase_b_step} → {phase_c_step}")
-    print(f"Phase C (all):     {phase_c_step} → {config.total_steps}")
-    print(f"τ_gumbel:          {config.tau_gumbel_init} → {config.tau_gumbel_final}")
+    print(f"Phase A (frozen):  0 → {phase_b_step - 1}")
+    print(f"Phase B (top-1):   {phase_b_step} → {config.total_steps - 1}")
+    print(f"τ_gumbel:          {config.tau_gumbel_init} → {config.tau_gumbel_final} (Phase A); "
+          f"holds at {config.tau_gumbel_final} (Phase B)")
+    print(f"target_entropy:    5.0 (corrected for 9D action space)")
 
     # --- Environment ---
     battery_config = dict(
@@ -90,21 +100,28 @@ def train_stage2(config: Stage2Config = None):
         tau_gumbel=config.tau_gumbel_init,
     )
 
-    # Load pretrained weights; critic stays fresh (init_from_stage1 does not copy critic)
-    if os.path.exists(config.stage1_checkpoint):
-        agent.init_from_stage1(config.stage1_checkpoint)
-        print(f"Loaded Stage 1 weights from {config.stage1_checkpoint}")
+    # Weight initialization
+    if scratch:
+        # Scratch baseline: all weights remain at PyTorch default random init.
+        # Actor AS heads use the same initialization scheme as mode/energy heads
+        # (no near-zero bias), so the only variable vs Stage 2 v2 is initialization.
+        print("Scratch mode: all weights randomly initialized (no Stage 1 loading)")
     else:
-        print(f"WARNING: Stage 1 checkpoint not found: {config.stage1_checkpoint}")
-        print("         Training from scratch.")
+        # Load pretrained weights; critic stays fresh (init_from_stage1 does not copy critic)
+        if os.path.exists(config.stage1_checkpoint):
+            agent.init_from_stage1(config.stage1_checkpoint)
+            print(f"Loaded Stage 1 weights from {config.stage1_checkpoint}")
+        else:
+            print(f"WARNING: Stage 1 checkpoint not found: {config.stage1_checkpoint}")
+            print("         Falling back to random initialization.")
+
+    # Confirm target_entropy was set correctly in agent
+    print(f"Agent target_entropy: {agent.target_entropy:.4f} (expected 5.0)")
 
     # Phase A: freeze TTFE
     agent.freeze_ttfe()
     frozen_params = sum(p.numel() for p in agent.ttfe.parameters())
     print(f"Phase A: TTFE frozen ({frozen_params:,} params)")
-
-    # Gumbel annealing range
-    tau_gumbel_range = config.tau_gumbel_init - config.tau_gumbel_final
 
     # --- Training loop ---
     obs, _ = env.reset()
@@ -136,21 +153,13 @@ def train_stage2(config: Stage2Config = None):
 
     while step < config.total_steps:
 
-        # --- Phase transitions ---
+        # --- Phase transition: A → B ---
         if current_phase == "A" and step >= phase_b_step:
             agent.unfreeze_ttfe_top_layers(n_layers=1, lr=config.lr_ttfe)
             current_phase = "B"
             print(
                 f"\n[Phase B] Step {step}: Unfroze top TTFE layer "
-                f"(lr={config.lr_ttfe})",
-                flush=True,
-            )
-        elif current_phase == "B" and step >= phase_c_step:
-            agent.unfreeze_ttfe_all(lr=config.lr_ttfe)
-            current_phase = "C"
-            print(
-                f"\n[Phase C] Step {step}: Unfroze all TTFE layers "
-                f"(lr={config.lr_ttfe}; grad_scale=0.1; critic_clip=0.5)",
+                f"(lr={config.lr_ttfe}, grad_scale=0.1)",
                 flush=True,
             )
             # Confirm TTFE optimizer lr for each param group
@@ -191,9 +200,16 @@ def train_stage2(config: Stage2Config = None):
         # Store symlog-transformed reward in replay buffer
         agent.buffer.add(obs, action, transformed_reward, next_obs, terminated)
 
-        # --- Anneal Gumbel temperature ---
-        frac = min(1.0, step / max(config.total_steps, 1))
-        agent.tau_gumbel = config.tau_gumbel_init - frac * tau_gumbel_range
+        # --- Gumbel temperature schedule ---
+        # Phase A: anneal 0.8 → 0.5 linearly
+        # Phase B: hold at 0.5 (warm enough for continued exploration; no further cooling)
+        if step < phase_b_step:
+            agent.tau_gumbel = (
+                config.tau_gumbel_init
+                - (config.tau_gumbel_init - config.tau_gumbel_final) * (step / phase_b_step)
+            )
+        else:
+            agent.tau_gumbel = config.tau_gumbel_final
 
         # --- Update ---
         metrics = {}
@@ -266,11 +282,11 @@ def train_stage2(config: Stage2Config = None):
             )
             nan_flag = " *** NaN DETECTED ***" if has_nan else ""
 
-            # Phase C grad_c warning
+            # grad_c warning (applies in Phase B when TTFE is live)
             grad_c_val = metrics.get("critic_grad_norm", 0)
-            if current_phase == "C" and grad_c_val > 100:
+            if current_phase == "B" and grad_c_val > 100:
                 print(
-                    f"  [WARNING] Phase C grad_c={grad_c_val:.1f} exceeds 100 at step {step}",
+                    f"  [WARNING] Phase B grad_c={grad_c_val:.1f} exceeds 100 at step {step}",
                     flush=True,
                 )
 
@@ -342,7 +358,7 @@ def train_stage2(config: Stage2Config = None):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 2 Training (stage2_v1)")
+    parser = argparse.ArgumentParser(description="Stage 2 Training (stage2_v2 / scratch)")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--log-interval", type=int, default=None)
@@ -350,9 +366,16 @@ if __name__ == "__main__":
         "--stage1-checkpoint", type=str, default=None,
         help="Override Stage 1 checkpoint path"
     )
+    parser.add_argument(
+        "--scratch", action="store_true",
+        help="Train from scratch (no pretrained weights). Controls for initialization "
+             "only — all other hyperparameters are identical to Stage 2 v2."
+    )
     args = parser.parse_args()
 
     config = Stage2Config()
+    if args.scratch:
+        config.checkpoint_dir = "checkpoints/stage2_scratch"
     if args.steps is not None:
         config.total_steps = args.steps
     if args.device is not None:
@@ -362,4 +385,4 @@ if __name__ == "__main__":
     if args.stage1_checkpoint is not None:
         config.stage1_checkpoint = args.stage1_checkpoint
 
-    train_stage2(config)
+    train_stage2(config, scratch=args.scratch)

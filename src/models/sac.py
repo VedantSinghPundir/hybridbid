@@ -106,11 +106,14 @@ class SACAgent:
         for p in self.critic_target.parameters():
             p.requires_grad = False
 
-        # Target entropy: log(3) for discrete mode only.
-        # Li et al. specifies log(3) - n_continuous, but that yields ~0.099 (near-zero),
-        # causing alpha to collapse in ~15k steps and mode diversity to die.
-        # Using log(3) ≈ 1.099 forces the policy to maintain spread across all 3 modes.
-        self.target_entropy = float(np.log(3))
+        # Target entropy calibrated per stage:
+        # Stage 1 (4D): log(3) ≈ 1.099 — accounts for 3-mode discrete entropy.
+        # Stage 2 (9D): 5.0 — corrected for 5 additional continuous AS heads.
+        #   Each Gaussian head contributes ~1.42 nats at unit variance; theoretical
+        #   max is log(3) + 5 * 0.5 * log(2πe) ≈ 8.2, but AS heads start near-zero
+        #   with bounded outputs, so 5.0 is a conservative floor that prevents collapse
+        #   without forcing excess exploration.
+        self.target_entropy = float(np.log(3)) if stage == 1 else 5.0
         self.log_alpha = torch.zeros(1, device=device, requires_grad=True)
 
         # Optimizers
@@ -191,9 +194,9 @@ class SACAgent:
         tau_gumbel : float, optional
             Override Gumbel temperature for this update. Uses self.tau_gumbel if None.
         phase : str
-            Training phase ('A', 'B', 'C'). Phase C applies tighter critic gradient
-            clipping (max_norm=0.5) and TTFE gradient scaling (×0.1) to stabilize
-            the freshly-unfrozen TTFE against a not-yet-mature critic.
+            Training phase ('A', 'B'). Phase B applies TTFE gradient scaling (×0.1)
+            to stabilize the freshly-unfrozen top TTFE layer. Phase C is removed in
+            Stage 2 v2 — full TTFE unfreeze eroded pretrained representations.
 
         Returns dict of losses/metrics.
         """
@@ -240,10 +243,8 @@ class SACAgent:
         # Per-component grad norms (pre-clip)
         grad_q1 = _grad_norm(self.critic.q1.parameters())
         grad_q2 = _grad_norm(self.critic.q2.parameters())
-        # Phase C: tighter critic clipping — fresh TTFE can amplify TD errors
-        critic_clip_norm = 0.5 if phase == "C" else self.max_grad_norm
         critic_grad_norm = nn.utils.clip_grad_norm_(
-            self.critic.parameters(), critic_clip_norm
+            self.critic.parameters(), self.max_grad_norm
         )
         self.critic_optimizer.step()
 
@@ -277,8 +278,9 @@ class SACAgent:
             [self.ttfe.input_proj.weight, self.ttfe.input_proj.bias, self.ttfe.pos_embedding]
         )
         grad_ttfe_attn = _grad_norm(self.ttfe.transformer.parameters())
-        # Phase C: additional 10× TTFE gradient damping (belt-and-suspenders with 3e-5 lr)
-        if phase == "C":
+        # Phase B: 10× TTFE gradient damping when top layer is unfrozen
+        # (belt-and-suspenders with 3e-5 lr; prevents TTFE disruption from a fresh critic)
+        if phase == "B":
             for p in self.ttfe.parameters():
                 if p.grad is not None:
                     p.grad *= 0.1
@@ -302,6 +304,11 @@ class SACAgent:
         self.alpha_optimizer.zero_grad()
         alpha_loss.backward()
         self.alpha_optimizer.step()
+        # Floor: prevent alpha from collapsing below 0.05 (insurance for Stage 2's
+        # 9D action space where corrected target_entropy=5.0 should self-regulate,
+        # but log_probs can still spike during early AS head learning).
+        with torch.no_grad():
+            self.log_alpha.clamp_(min=float(np.log(0.05)))  # log(0.05) ≈ -2.996
 
         # --- Soft update target networks ---
         self._soft_update()
