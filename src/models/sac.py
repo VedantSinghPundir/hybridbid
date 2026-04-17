@@ -54,6 +54,7 @@ class SACAgent:
         stage: int = 1,
         device: str = "cpu",
         n_prices: int = 12,
+        n_prices_flat: int = None,
         d_model: int = 64,
         nhead: int = 8,
         n_layers: int = 2,
@@ -85,7 +86,11 @@ class SACAgent:
         self.n_continuous = 1 + self.n_as_dims     # 1 or 6 (continuous dims only)
 
         self.n_prices = n_prices
-        self.obs_dim = d_model + n_prices + static_dim  # 64 + 12 + 14 = 90
+        # n_prices_flat: how many dims from price_history[-1] appear in the flat obs.
+        # For enriched obs (v6.0): n_prices=36 (TTFE input) but only 12 go into flat obs.
+        # Defaults to n_prices for backward compatibility with all prior stages.
+        self.n_prices_flat = n_prices_flat if n_prices_flat is not None else n_prices
+        self.obs_dim = d_model + self.n_prices_flat + static_dim  # e.g. 64+12+14=90 or 64+12+32=108
 
         # Default buffer/batch sizes per stage
         if buffer_capacity is None:
@@ -141,10 +146,15 @@ class SACAgent:
     PRICE_NORM = 1000.0
 
     def _encode_obs(self, price_history: torch.Tensor, static_features: torch.Tensor) -> torch.Tensor:
-        """Run TTFE on price history and concatenate with current prices + static features."""
-        ph_norm = price_history / self.PRICE_NORM            # scale $/MWh → ~[0, 9]
-        temporal = self.ttfe(ph_norm)                        # (batch, d_model)
-        current_prices = ph_norm[:, -1, :]                   # (batch, n_prices)
+        """Run TTFE on price history and concatenate with current prices + static features.
+
+        price_history shape: (batch, seq_len, n_prices) — n_prices=12 standard, 36 enriched.
+        Only the first n_prices_flat dims of the last timestep enter the flat observation,
+        so the 24 appended DA LMP dims don't double-count into the flat part.
+        """
+        ph_norm = price_history / self.PRICE_NORM             # scale $/MWh → ~[0, 9]
+        temporal = self.ttfe(ph_norm)                         # (batch, d_model)
+        current_prices = ph_norm[:, -1, :self.n_prices_flat]  # (batch, n_prices_flat)
         return torch.cat([temporal, current_prices, static_features], dim=-1)  # (batch, obs_dim)
 
     @torch.no_grad()

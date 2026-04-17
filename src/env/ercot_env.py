@@ -70,7 +70,14 @@ class ERCOTBatteryEnv(gym.Env):
     """
     Gymnasium environment for ERCOT battery bidding.
 
-    Observation: dict with price_history (seq_len, 12) and static_features (14,)
+    Observation: dict with price_history and static_features.
+      Standard (enriched_obs=False):
+        price_history:   (seq_len, 12)
+        static_features: (14,)  — system(7) + time(6) + soc(1)
+      Enriched (enriched_obs=True, v6.0):
+        price_history:   (seq_len, 36) — orig 12 + 24 DA LMP hourly values tiled
+        static_features: (32,)  — system(7) + time(6) + soc(1) + price_features(18)
+
     Action:
       energy_only:  Box(-1, 1, (4,))  — [mode(3), energy_mag(1)]
       co_optimize:  Box(-1, 1, (9,))  — [mode(3), energy_mag(1), as_mags(5)]
@@ -85,6 +92,7 @@ class ERCOTBatteryEnv(gym.Env):
         battery_config: Optional[dict] = None,
         seq_len: int = SEQ_LEN,
         date_range: Optional[tuple] = None,
+        enriched_obs: bool = False,
     ):
         """
         Parameters
@@ -104,6 +112,7 @@ class ERCOTBatteryEnv(gym.Env):
         assert mode in ("energy_only", "co_optimize")
         self.mode = mode
         self.seq_len = seq_len
+        self.enriched_obs = enriched_obs
 
         # Battery config
         bc = {**DEFAULT_BATTERY, **(battery_config or {})}
@@ -126,12 +135,16 @@ class ERCOTBatteryEnv(gym.Env):
         self.action_space = gym.spaces.Box(
             low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32
         )
+        # Enriched obs (v6.0): price_history=(seq_len,36), static_features=(32,)
+        # Standard:            price_history=(seq_len,12), static_features=(14,)
+        n_price_hist = 36 if enriched_obs else N_PRICES
+        static_dim   = 32 if enriched_obs else 14
         self.observation_space = gym.spaces.Dict({
             "price_history": gym.spaces.Box(
-                low=-np.inf, high=np.inf, shape=(seq_len, N_PRICES), dtype=np.float32
+                low=-np.inf, high=np.inf, shape=(seq_len, n_price_hist), dtype=np.float32
             ),
             "static_features": gym.spaces.Box(
-                low=-np.inf, high=np.inf, shape=(14,), dtype=np.float32
+                low=-np.inf, high=np.inf, shape=(static_dim,), dtype=np.float32
             ),
         })
 
@@ -190,6 +203,10 @@ class ERCOTBatteryEnv(gym.Env):
             40000,         # net load
         ], dtype=np.float32)
 
+        # Enriched obs: pre-compute 24 hourly DA LMP values per ERCOT operating day
+        if self.enriched_obs:
+            self._precompute_da_24h(merged)
+
     def _read_parquets(self, directory: str) -> pd.DataFrame:
         """Read all Parquet files in a directory and concatenate."""
         files = sorted(glob.glob(os.path.join(directory, "*.parquet")))
@@ -197,6 +214,114 @@ class ERCOTBatteryEnv(gym.Env):
             raise FileNotFoundError(f"No Parquet files in {directory}")
         dfs = [pd.read_parquet(f) for f in files]
         return pd.concat(dfs).sort_index()
+
+    def _precompute_da_24h(self, merged: pd.DataFrame):
+        """
+        Pre-compute a (n_steps, 24) array of hourly DA LMP values.
+
+        For each 5-min step, stores the 24 hourly dam_spp values for the
+        ERCOT operating day (midnight-to-midnight Central Time).
+
+        dam_spp is already constant within each UTC hour; we resample to
+        hourly and group by Central Time date to align with the operating day.
+        """
+        # Convert to Central Time for ERCOT operating-day alignment
+        if merged.index.tz is not None:
+            ts_ct = merged.index.tz_convert("US/Central")
+        else:
+            ts_ct = merged.index
+
+        dam_spp_vals = merged["dam_spp"].fillna(0.0).values
+
+        # Build hourly DA LMP series in Central Time
+        da_series = pd.Series(dam_spp_vals, index=ts_ct, dtype=np.float32)
+        da_hourly = da_series.resample("1h").first().fillna(0.0)
+
+        # Build per-CT-date lookup: date → (24,) array
+        da_daily = {}
+        for date, group in da_hourly.groupby(da_hourly.index.date):
+            arr = np.zeros(24, dtype=np.float32)
+            for ts_h, val in group.items():
+                if ts_h.hour < 24:
+                    arr[ts_h.hour] = float(val)
+            da_daily[date] = arr
+
+        # Build (n_steps, 24) array — one lookup per step
+        ct_dates = np.array([ts.date() for ts in ts_ct])
+        unique_dates = sorted(da_daily.keys())
+        date_to_row = {d: i for i, d in enumerate(unique_dates)}
+        da_matrix = np.stack([da_daily[d] for d in unique_dates])  # (n_days, 24)
+
+        row_indices = np.array(
+            [date_to_row[d] if d in date_to_row else 0 for d in ct_dates]
+        )
+        self.da_24h_data = da_matrix[row_indices]  # (n_steps, 24)
+        self._ts_ct = ts_ct  # keep for use in _compute_price_features
+
+    def _compute_price_features(self, idx: int) -> np.ndarray:
+        """
+        Compute 18 engineered price features from available history (all causal).
+
+        Features:
+          [0:3]   Percentile rank of current RT LMP vs 4h / 12h / 24h windows
+          [3:6]   Z-score of current RT LMP vs 4h / 12h / 24h windows
+          [6:15]  Rolling min/max/std for 1h / 4h / 12h windows (÷1000)
+          [15]    DA-RT basis: (da_lmp_now - rt_lmp) / 1000
+          [16:18] Cyclical hours to DA peak / trough (÷24, wraps at midnight)
+        """
+        rt_lmp = float(self.price_data[idx, 0])
+        da_lmp_now = float(self.price_data[idx, 6])  # dam_spp index in PRICE_COLS
+
+        # Rolling RT LMP windows (look back from current step in full dataset)
+        w_1h  = self.price_data[max(0, idx - 11) : idx + 1, 0]
+        w_4h  = self.price_data[max(0, idx - 47) : idx + 1, 0]
+        w_12h = self.price_data[max(0, idx - 143): idx + 1, 0]
+        w_24h = self.price_data[max(0, idx - 287): idx + 1, 0]
+
+        # Percentile ranks ∈ [0, 1]
+        pct_rank_4h  = float(np.mean(w_4h  < rt_lmp))
+        pct_rank_12h = float(np.mean(w_12h < rt_lmp))
+        pct_rank_24h = float(np.mean(w_24h < rt_lmp))
+
+        # Z-scores (roughly ∈ [-5, 5] for typical prices)
+        z_4h  = float((rt_lmp - np.mean(w_4h))  / (np.std(w_4h)  + 1e-6))
+        z_12h = float((rt_lmp - np.mean(w_12h)) / (np.std(w_12h) + 1e-6))
+        z_24h = float((rt_lmp - np.mean(w_24h)) / (np.std(w_24h) + 1e-6))
+
+        # Rolling min/max/std (÷1000 to match TTFE price scale)
+        rolling_min_1h  = float(np.min(w_1h))  / 1000.0
+        rolling_max_1h  = float(np.max(w_1h))  / 1000.0
+        rolling_std_1h  = float(np.std(w_1h))  / 1000.0
+        rolling_min_4h  = float(np.min(w_4h))  / 1000.0
+        rolling_max_4h  = float(np.max(w_4h))  / 1000.0
+        rolling_std_4h  = float(np.std(w_4h))  / 1000.0
+        rolling_min_12h = float(np.min(w_12h)) / 1000.0
+        rolling_max_12h = float(np.max(w_12h)) / 1000.0
+        rolling_std_12h = float(np.std(w_12h)) / 1000.0
+
+        # DA-RT basis
+        da_rt_basis = (da_lmp_now - rt_lmp) / 1000.0
+
+        # DA peak/trough hours from today's pre-computed 24h array
+        da_24h = self.da_24h_data[idx]  # (24,) hourly DA LMPs for today (CT)
+        peak_hour   = int(np.argmax(da_24h))
+        trough_hour = int(np.argmin(da_24h))
+
+        ts_ct = self._ts_ct[idx]
+        current_hour = ts_ct.hour
+
+        hours_to_peak   = float((peak_hour   - current_hour) % 24) / 24.0
+        hours_to_trough = float((trough_hour - current_hour) % 24) / 24.0
+
+        return np.array([
+            pct_rank_4h, pct_rank_12h, pct_rank_24h,
+            z_4h, z_12h, z_24h,
+            rolling_min_1h,  rolling_max_1h,  rolling_std_1h,
+            rolling_min_4h,  rolling_max_4h,  rolling_std_4h,
+            rolling_min_12h, rolling_max_12h, rolling_std_12h,
+            da_rt_basis,
+            hours_to_peak, hours_to_trough,
+        ], dtype=np.float32)
 
     def _build_day_index(self):
         """Build index of day start positions in the data array."""
@@ -238,12 +363,24 @@ class ERCOTBatteryEnv(gym.Env):
     def _get_observation(self, idx: int) -> dict:
         """Build observation dict for current step."""
         start = idx - self.seq_len + 1
-        price_history = self.price_data[start:idx + 1].copy()
+        price_history_12 = self.price_data[start:idx + 1].copy()  # (seq_len, 12)
 
         system = self.system_data[idx] / self._system_scales
         time_feats = self._get_time_features(idx)
         soc_frac = np.array([self.soc / self.e_max], dtype=np.float32)
-        static_features = np.concatenate([system, time_feats, soc_frac])  # (14,)
+
+        if self.enriched_obs:
+            # Price history: original 12 dims + 24 DA LMP values tiled (seq_len, 36)
+            da_24h_norm = self.da_24h_data[idx] / 1000.0  # ÷1000 to match TTFE scale
+            da_tiled = np.tile(da_24h_norm, (self.seq_len, 1))  # (seq_len, 24)
+            price_history = np.concatenate([price_history_12, da_tiled], axis=1)  # (seq_len, 36)
+
+            # Static features: system(7) + time(6) + soc(1) + price_features(18) = 32
+            price_feats = self._compute_price_features(idx)
+            static_features = np.concatenate([system, time_feats, soc_frac, price_feats])
+        else:
+            price_history = price_history_12
+            static_features = np.concatenate([system, time_feats, soc_frac])  # (14,)
 
         return {
             "price_history": price_history,

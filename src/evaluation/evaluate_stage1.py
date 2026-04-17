@@ -22,7 +22,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.env.ercot_env import ERCOTBatteryEnv
 from src.models.sac import SACAgent
-from src.training.config import Stage1Config
+from src.training.config import Stage1Config, Stage1V60Config
 
 # Baselines from CLAUDE.md (pre-RTC+B, $/day for 10 MW / 20 MWh battery)
 TBEX_DAILY = 870.0
@@ -36,6 +36,8 @@ TEST_END   = "2025-12-04"
 def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = True):
     if config is None:
         config = Stage1Config()
+
+    enriched = isinstance(config, Stage1V60Config)
 
     # --- Environment (test set, deterministic) ---
     battery_config = dict(
@@ -51,6 +53,7 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
         battery_config=battery_config,
         seq_len=config.seq_len,
         date_range=(TEST_START, TEST_END),
+        enriched_obs=enriched,
     )
     n_days = len(env.day_starts)
 
@@ -59,6 +62,7 @@ def evaluate(checkpoint_path: str, config: Stage1Config = None, verbose: bool = 
         stage=1,
         device=config.device,
         n_prices=config.n_prices,
+        n_prices_flat=getattr(config, "n_prices_flat", None),
         d_model=config.d_model,
         nhead=config.nhead,
         n_layers=config.n_layers,
@@ -170,9 +174,13 @@ if __name__ == "__main__":
         help="Path to Stage 1 checkpoint",
     )
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--v60", action="store_true",
+        help="Use Stage1V60Config (enriched obs: 36-dim TTFE + 18 price features, obs_dim=108)",
+    )
     args = parser.parse_args()
 
-    cfg = Stage1Config()
+    cfg = Stage1V60Config() if args.v60 else Stage1Config()
     if args.device:
         cfg.device = args.device
 

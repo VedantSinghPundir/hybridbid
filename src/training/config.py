@@ -85,6 +85,25 @@ class Stage1Config(TrainConfig):
 
 
 @dataclass
+class Stage1V60Config(Stage1Config):
+    """Stage 1 v6.0: Enriched observations with DAM LMPs + engineered price features.
+
+    Key changes from v5.9:
+      - n_prices=36: TTFE input expanded to 12 orig + 24 hourly DA LMP values
+      - n_prices_flat=12: only original 12 dims used in flat obs (no double-count)
+      - static_dim=32: 14 original + 18 engineered price features
+      - obs_dim: 64 + 12 + 32 = 108 (was 64 + 12 + 14 = 90)
+      - checkpoint_dir: checkpoints/stage1_v60
+      All training dynamics identical to v5.9 (symlog, SAC v2, τ=0.005, etc.)
+    """
+    n_prices: int = 36        # TTFE input: 12 orig + 24 DA LMP
+    n_prices_flat: int = 12   # flat obs: first 12 dims only (orig prices)
+    static_dim: int = 32      # 14 orig + 18 engineered price features
+    checkpoint_dir: str = "checkpoints/stage1_v60"
+    save_every: int = 50_000  # checkpoints every 50k (same granularity as v5.9)
+
+
+@dataclass
 class Stage2Config(TrainConfig):
     """Stage 2: Post-RTC+B co-optimization fine-tuning (stage2_v2).
 

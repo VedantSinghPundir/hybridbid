@@ -27,20 +27,25 @@ def symlog(x: float) -> float:
 
 from src.env.ercot_env import ERCOTBatteryEnv
 from src.models.sac import SACAgent
-from src.training.config import Stage1Config
+from src.training.config import Stage1Config, Stage1V60Config
 
 
-def train_stage1(config: Stage1Config = None):
+def train_stage1(config: Stage1Config = None, enriched_obs: bool = False):
     if config is None:
         config = Stage1Config()
 
-    print(f"=== Stage 1: Energy-Only Training ===")
+    version = "v6.0" if enriched_obs else "v5.9"
+    print(f"=== Stage 1: Energy-Only Training ({version}) ===")
     print(f"Data: {config.train_start} to {config.train_end}")
     print(f"Device: {config.device}")
     print(f"Total steps: {config.total_steps}")
     print(f"Max grad norm: {config.max_grad_norm}")
     print(f"LR: actor={config.lr_actor} critic={config.lr_critic} ttfe={config.lr_ttfe}")
     print(f"τ_gumbel: {config.tau_gumbel_init} → {config.tau_gumbel_final}")
+    if enriched_obs:
+        n_prices_flat = getattr(config, "n_prices_flat", config.n_prices)
+        obs_dim = config.d_model + n_prices_flat + config.static_dim
+        print(f"Enriched obs: TTFE={config.n_prices}-dim input, obs_dim={obs_dim}, static_dim={config.static_dim}")
 
     # Create environment
     battery_config = dict(
@@ -56,6 +61,7 @@ def train_stage1(config: Stage1Config = None):
         battery_config=battery_config,
         seq_len=config.seq_len,
         date_range=(config.train_start, config.train_end),
+        enriched_obs=enriched_obs,
     )
 
     # Create SAC agent
@@ -63,6 +69,7 @@ def train_stage1(config: Stage1Config = None):
         stage=1,
         device=config.device,
         n_prices=config.n_prices,
+        n_prices_flat=getattr(config, "n_prices_flat", None),
         d_model=config.d_model,
         nhead=config.nhead,
         n_layers=config.n_layers,
@@ -99,6 +106,11 @@ def train_stage1(config: Stage1Config = None):
     recent_socs = []
     mode_counts = {0: 0, 1: 0, 2: 0}  # charge=0, discharge=1, idle=2
 
+    # Rolling enriched feature values for sanity logging (v6.0 only)
+    recent_pct_rank_24h = []
+    recent_z_24h = []
+    recent_da_rt_basis = []
+
     # Last-good-state snapshot for NaN recovery
     prev_snapshot = None
 
@@ -124,6 +136,16 @@ def train_stage1(config: Stage1Config = None):
         episode_raw_reward += reward  # original env reward (pre-symlog) for logging
         recent_socs.append(info["soc"])
         mode_counts[info["mode"]] += 1
+
+        # Track enriched feature values for sanity logging (indices in static_features)
+        # static_features layout (enriched): [system(7), time(6), soc(1), price_feats(18)]
+        # price_feats: [pct_rank_4h, pct_rank_12h, pct_rank_24h, z_4h, z_12h, z_24h, ...]
+        if enriched_obs and "static_features" in obs:
+            sf = obs["static_features"]
+            if len(sf) >= 32:
+                recent_pct_rank_24h.append(float(sf[16]))   # pct_rank_24h
+                recent_z_24h.append(float(sf[19]))           # z_24h
+                recent_da_rt_basis.append(float(sf[29]))     # da_rt_basis
 
         # Store symlog-transformed reward in replay buffer
         agent.buffer.add(obs, action, transformed_reward, next_obs, terminated)
@@ -196,6 +218,15 @@ def train_stage1(config: Stage1Config = None):
             )
             nan_flag = " *** NaN DETECTED ***" if has_nan else ""
 
+            # Enriched feature summary (v6.0 only)
+            feat_str = ""
+            if enriched_obs and recent_pct_rank_24h:
+                avg_pct = np.mean(recent_pct_rank_24h[-200:])
+                avg_z   = np.mean(recent_z_24h[-200:])
+                avg_basis = np.mean(recent_da_rt_basis[-200:])
+                feat_str = (f" | pct24h={avg_pct:.2f} z24h={avg_z:.2f}"
+                            f" da_rt={avg_basis:.4f}")
+
             print(
                 f"Step {step:>7d}/{config.total_steps} | "
                 f"ep={episode_count} | "
@@ -212,7 +243,7 @@ def train_stage1(config: Stage1Config = None):
                 f"[proj={metrics.get('grad_ttfe_proj', 0):.1f} attn={metrics.get('grad_ttfe_attn', 0):.1f}] | "
                 f"mode=[ch={mode_pct_charge:.0f}% dc={mode_pct_discharge:.0f}% id={mode_pct_idle:.0f}%] | "
                 f"tau_g={gumbel_temperature:.3f} | "
-                f"{steps_per_sec:.1f} steps/s{nan_flag}",
+                f"{steps_per_sec:.1f} steps/s{feat_str}{nan_flag}",
                 flush=True,
             )
 
@@ -226,9 +257,13 @@ def train_stage1(config: Stage1Config = None):
                     print(f"  Emergency checkpoint saved: {emergency_path}")
                 return agent, []
 
-            # Clear old SoC history to avoid memory growth
+            # Clear old history to avoid memory growth
             if len(recent_socs) > 1000:
                 recent_socs = recent_socs[-500:]
+            if len(recent_pct_rank_24h) > 2000:
+                recent_pct_rank_24h = recent_pct_rank_24h[-1000:]
+                recent_z_24h = recent_z_24h[-1000:]
+                recent_da_rt_basis = recent_da_rt_basis[-1000:]
 
         # Checkpointing
         if step % save_interval == 0:
@@ -260,9 +295,13 @@ if __name__ == "__main__":
     parser.add_argument("--end", type=str, default=None, help="Override train_end date")
     parser.add_argument("--device", type=str, default=None, help="Override device")
     parser.add_argument("--log-interval", type=int, default=None, help="Override log interval")
+    parser.add_argument(
+        "--v60", action="store_true",
+        help="Stage 1 v6.0: enriched obs (36-dim TTFE + 18 engineered features, obs_dim=108)"
+    )
     args = parser.parse_args()
 
-    config = Stage1Config()
+    config = Stage1V60Config() if args.v60 else Stage1Config()
     if args.steps is not None:
         config.total_steps = args.steps
     if args.start is not None:
@@ -274,4 +313,4 @@ if __name__ == "__main__":
     if args.log_interval is not None:
         config.log_interval = args.log_interval
 
-    train_stage1(config)
+    train_stage1(config, enriched_obs=args.v60)
