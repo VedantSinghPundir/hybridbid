@@ -32,7 +32,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.env.ercot_env import ERCOTBatteryEnv
 from src.models.sac import SACAgent
-from src.training.config import Stage2Config
+from src.training.config import Stage2Config, Stage2V3aConfig
 
 # AS product names (matches env's projected_action[1:6] ordering)
 AS_PRODUCTS = ["regup", "regdn", "rrs", "ecrs", "nsrs"]
@@ -47,7 +47,14 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
     if config is None:
         config = Stage2Config()
 
-    run_label = "stage2_scratch" if scratch else "stage2_v2"
+    v3a = isinstance(config, Stage2V3aConfig)
+    if scratch:
+        run_label = "stage2_scratch"
+    elif v3a:
+        run_label = "stage2_v3a"
+    else:
+        run_label = "stage2_v2"
+
     phase_b_step = int(config.total_steps * config.phase_b_start_frac)
 
     print(f"=== Stage 2: Co-Optimization Fine-Tuning ({run_label}) ===")
@@ -61,6 +68,9 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
     print(f"τ_gumbel:          {config.tau_gumbel_init} → {config.tau_gumbel_final} (Phase A); "
           f"holds at {config.tau_gumbel_final} (Phase B)")
     print(f"target_entropy:    5.0 (corrected for 9D action space)")
+    if v3a:
+        print(f"Enriched flat obs: static_dim=32 (14 orig + 18 price features), "
+              f"obs_dim=108, TTFE input=12-dim (unchanged)")
 
     # --- Environment ---
     battery_config = dict(
@@ -76,6 +86,7 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
         battery_config=battery_config,
         seq_len=config.seq_len,
         date_range=(config.train_start, config.train_end),
+        enriched_flat=v3a,
     )
 
     # --- Agent ---
@@ -83,6 +94,7 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
         stage=2,
         device=config.device,
         n_prices=config.n_prices,
+        n_prices_flat=getattr(config, "n_prices_flat", None),
         d_model=config.d_model,
         nhead=config.nhead,
         n_layers=config.n_layers,
@@ -146,6 +158,11 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
     # Per-product AS fraction accumulators (rolling window of step-level values)
     as_frac_window = {p: [] for p in AS_PRODUCTS}
 
+    # Enriched feature sanity trackers (v3a only)
+    recent_pct_rank_24h = []
+    recent_z_24h = []
+    recent_da_rt_basis = []
+
     prev_snapshot = None
     os.makedirs(config.checkpoint_dir, exist_ok=True)
 
@@ -196,6 +213,16 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
         else:
             for prod in AS_PRODUCTS:
                 as_frac_window[prod].append(0.0)
+
+        # Track enriched price features for sanity logging (v3a)
+        # static_features layout (enriched_flat): [system(7), time(6), soc(1), price_feats(18)]
+        # price_feats: [pct_rank_4h, pct_rank_12h, pct_rank_24h, z_4h, z_12h, z_24h, ...]
+        if v3a and "static_features" in obs:
+            sf = obs["static_features"]
+            if len(sf) >= 32:
+                recent_pct_rank_24h.append(float(sf[16]))   # pct_rank_24h
+                recent_z_24h.append(float(sf[19]))           # z_24h
+                recent_da_rt_basis.append(float(sf[29]))     # da_rt_basis
 
         # Store symlog-transformed reward in replay buffer
         agent.buffer.add(obs, action, transformed_reward, next_obs, terminated)
@@ -290,6 +317,15 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
                     flush=True,
                 )
 
+            # Enriched feature summary (v3a only)
+            feat_str = ""
+            if v3a and recent_pct_rank_24h:
+                avg_pct = np.mean(recent_pct_rank_24h[-200:])
+                avg_z   = np.mean(recent_z_24h[-200:])
+                avg_basis = np.mean(recent_da_rt_basis[-200:])
+                feat_str = (f" | pct24h={avg_pct:.2f} z24h={avg_z:.2f}"
+                            f" da_rt={avg_basis:.4f}")
+
             print(
                 f"Step {step:>7d}/{config.total_steps} | "
                 f"ph={current_phase} | "
@@ -298,8 +334,7 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
                 f"actor={metrics.get('actor_loss', 0):.4f} | "
                 f"alpha={metrics.get('alpha', 0):.4f} | "
                 f"avg_reward={avg_reward:.1f} | "
-                f"avg_raw_reward={avg_raw_reward:.1f} | "
-                f"avg_energy_rev={avg_energy_rev:.1f} | "
+                f"avg_energy_rev={avg_energy_rev:.2f} | "
                 f"avg_as_rev={avg_as_rev:.2f} | "
                 f"avg_soc={avg_soc:.2f} | "
                 f"grad_c={metrics.get('critic_grad_norm', 0):.3f} "
@@ -312,7 +347,7 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
                 f"rrs={as_means['rrs']:.3f} ec={as_means['ecrs']:.3f} "
                 f"ns={as_means['nsrs']:.3f}] | "
                 f"tau_g={agent.tau_gumbel:.3f} | "
-                f"{steps_per_sec:.1f} steps/s{nan_flag}",
+                f"{steps_per_sec:.1f} steps/s{feat_str}{nan_flag}",
                 flush=True,
             )
 
@@ -332,6 +367,10 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
             for prod in AS_PRODUCTS:
                 if len(as_frac_window[prod]) > 5000:
                     as_frac_window[prod] = as_frac_window[prod][-2000:]
+            if len(recent_pct_rank_24h) > 2000:
+                recent_pct_rank_24h = recent_pct_rank_24h[-1000:]
+                recent_z_24h = recent_z_24h[-1000:]
+                recent_da_rt_basis = recent_da_rt_basis[-1000:]
 
         # --- Checkpoint ---
         if step % save_interval == 0:
@@ -358,7 +397,7 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
 
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Stage 2 Training (stage2_v2 / scratch)")
+    parser = argparse.ArgumentParser(description="Stage 2 Training (stage2_v2 / v3a / scratch)")
     parser.add_argument("--steps", type=int, default=None)
     parser.add_argument("--device", type=str, default=None)
     parser.add_argument("--log-interval", type=int, default=None)
@@ -371,9 +410,14 @@ if __name__ == "__main__":
         help="Train from scratch (no pretrained weights). Controls for initialization "
              "only — all other hyperparameters are identical to Stage 2 v2."
     )
+    parser.add_argument(
+        "--v3a", action="store_true",
+        help="Stage 2 v3a: enriched flat obs (18 price features, obs_dim=108). "
+             "TTFE input stays 12-dim — loads perfectly from v5.9 300k."
+    )
     args = parser.parse_args()
 
-    config = Stage2Config()
+    config = Stage2V3aConfig() if args.v3a else Stage2Config()
     if args.scratch:
         config.checkpoint_dir = "checkpoints/stage2_scratch"
     if args.steps is not None:

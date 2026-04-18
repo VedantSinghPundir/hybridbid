@@ -93,6 +93,7 @@ class ERCOTBatteryEnv(gym.Env):
         seq_len: int = SEQ_LEN,
         date_range: Optional[tuple] = None,
         enriched_obs: bool = False,
+        enriched_flat: bool = False,
     ):
         """
         Parameters
@@ -107,12 +108,20 @@ class ERCOTBatteryEnv(gym.Env):
             TTFE lookback window length.
         date_range : tuple of (start_date, end_date) strings, optional
             Filter data to this date range.
+        enriched_obs : bool
+            v6.0 mode: expand TTFE input 12→36 AND static_features 14→32.
+        enriched_flat : bool
+            v3a mode: keep TTFE input at 12-dim, expand static_features 14→32 only.
+            Preserves v5.9 TTFE weight compatibility while adding 18 price features.
         """
         super().__init__()
         assert mode in ("energy_only", "co_optimize")
+        assert not (enriched_obs and enriched_flat), \
+            "enriched_obs and enriched_flat are mutually exclusive"
         self.mode = mode
         self.seq_len = seq_len
         self.enriched_obs = enriched_obs
+        self.enriched_flat = enriched_flat
 
         # Battery config
         bc = {**DEFAULT_BATTERY, **(battery_config or {})}
@@ -135,10 +144,12 @@ class ERCOTBatteryEnv(gym.Env):
         self.action_space = gym.spaces.Box(
             low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32
         )
-        # Enriched obs (v6.0): price_history=(seq_len,36), static_features=(32,)
-        # Standard:            price_history=(seq_len,12), static_features=(14,)
+        # Observation layout:
+        #   enriched_obs  (v6.0): price_history=(seq_len,36), static_features=(32,)
+        #   enriched_flat (v3a):  price_history=(seq_len,12), static_features=(32,)
+        #   standard:             price_history=(seq_len,12), static_features=(14,)
         n_price_hist = 36 if enriched_obs else N_PRICES
-        static_dim   = 32 if enriched_obs else 14
+        static_dim   = 32 if (enriched_obs or enriched_flat) else 14
         self.observation_space = gym.spaces.Dict({
             "price_history": gym.spaces.Box(
                 low=-np.inf, high=np.inf, shape=(seq_len, n_price_hist), dtype=np.float32
@@ -203,8 +214,8 @@ class ERCOTBatteryEnv(gym.Env):
             40000,         # net load
         ], dtype=np.float32)
 
-        # Enriched obs: pre-compute 24 hourly DA LMP values per ERCOT operating day
-        if self.enriched_obs:
+        # Pre-compute 24 hourly DA LMP values for enriched modes (v6.0 and v3a)
+        if self.enriched_obs or self.enriched_flat:
             self._precompute_da_24h(merged)
 
     def _read_parquets(self, directory: str) -> pd.DataFrame:
@@ -370,14 +381,17 @@ class ERCOTBatteryEnv(gym.Env):
         soc_frac = np.array([self.soc / self.e_max], dtype=np.float32)
 
         if self.enriched_obs:
-            # Price history: original 12 dims + 24 DA LMP values tiled (seq_len, 36)
+            # v6.0: TTFE input expanded 12→36 + static expanded 14→32
             da_24h_norm = self.da_24h_data[idx] / 1000.0  # ÷1000 to match TTFE scale
             da_tiled = np.tile(da_24h_norm, (self.seq_len, 1))  # (seq_len, 24)
             price_history = np.concatenate([price_history_12, da_tiled], axis=1)  # (seq_len, 36)
-
-            # Static features: system(7) + time(6) + soc(1) + price_features(18) = 32
             price_feats = self._compute_price_features(idx)
-            static_features = np.concatenate([system, time_feats, soc_frac, price_feats])
+            static_features = np.concatenate([system, time_feats, soc_frac, price_feats])  # (32,)
+        elif self.enriched_flat:
+            # v3a: TTFE input stays 12-dim, static expanded 14→32
+            price_history = price_history_12  # (seq_len, 12) — TTFE weights load cleanly from v5.9
+            price_feats = self._compute_price_features(idx)
+            static_features = np.concatenate([system, time_feats, soc_frac, price_feats])  # (32,)
         else:
             price_history = price_history_12
             static_features = np.concatenate([system, time_feats, soc_frac])  # (14,)

@@ -406,8 +406,10 @@ class SACAgent:
         """
         Initialize Stage 2 agent from Stage 1 checkpoint.
 
-        - TTFE weights copied from Stage 1.
-        - Actor: energy + mode components copied; AS heads initialized near-zero.
+        - TTFE weights copied from Stage 1 (always compatible — 12-dim input unchanged).
+        - Actor:
+            * If obs_dim unchanged (v2): all layers copied, AS heads near-zero.
+            * If obs_dim changed (v3a: 90→108): fc2+heads copied, fc1 fresh (dim mismatch).
         - Critics: fresh random initialization.
         - Buffer: empty.
         """
@@ -415,14 +417,31 @@ class SACAgent:
 
         ckpt = torch.load(stage1_checkpoint_path, map_location=self.device, weights_only=True)
 
+        # TTFE: always compatible (12-dim input, never changed)
         self.ttfe.load_state_dict(ckpt["ttfe"])
 
-        # Build temporary Stage 1 actor to transfer weights
-        stage1_actor = Actor(obs_dim=self.actor.obs_dim, n_as_dims=0,
-                             hidden_dim=self.actor.fc1.out_features)
+        # Infer Stage 1 obs_dim from saved fc1 weight shape
+        stage1_obs_dim = ckpt["actor"]["fc1.weight"].shape[1]
+        hidden_dim = self.actor.fc1.out_features
+
+        # Build Stage 1 actor with its original obs_dim
+        stage1_actor = Actor(obs_dim=stage1_obs_dim, n_as_dims=0, hidden_dim=hidden_dim)
         stage1_actor.load_state_dict(ckpt["actor"])
 
-        new_actor = Actor.init_stage2_from_stage1(stage1_actor, n_as_dims=self.n_as_dims)
+        if stage1_obs_dim == self.actor.obs_dim:
+            # Dims match (v2 / standard path): copy fc1 too
+            new_actor = Actor.init_stage2_from_stage1(stage1_actor, n_as_dims=self.n_as_dims)
+        else:
+            # Dims differ (v3a: 90→108): fc1 stays at fresh init, copy fc2+heads
+            print(
+                f"  init_from_stage1: obs_dim mismatch "
+                f"({stage1_obs_dim} → {self.actor.obs_dim}). "
+                f"fc1 initialized fresh; fc2+heads copied from Stage 1."
+            )
+            new_actor = Actor.init_stage2_from_stage1_new_obs(
+                stage1_actor, n_as_dims=self.n_as_dims, new_obs_dim=self.actor.obs_dim
+            )
+
         self.actor.load_state_dict(new_actor.state_dict())
 
     def freeze_ttfe(self):

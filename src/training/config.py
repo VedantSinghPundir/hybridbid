@@ -144,3 +144,22 @@ class Stage2Config(TrainConfig):
     log_interval: int = 1_000
     checkpoint_dir: str = "checkpoints/stage2_v2"
     save_every: int = 5_000
+
+
+@dataclass
+class Stage2V3aConfig(Stage2Config):
+    """Stage 2 v3a: Enriched flat observation (18 price features), TTFE unchanged.
+
+    Key changes from v2:
+      - static_dim: 14 → 32 (adds 18 engineered price features to flat obs only)
+      - TTFE input stays 12-dim — loads perfectly from v5.9 300k checkpoint
+      - obs_dim: 90 → 108 (64 TTFE + 12 raw prices + 32 static)
+      - Actor fc1 (90→256) cannot load from v5.9 (dim mismatch) — fresh init
+      - Actor fc2 + mode/energy heads: copied from v5.9
+      - total_steps: 200k (extended for broader search given larger obs space)
+      - phase_b_start_frac: 0.40 → Phase B at step 80k
+      - checkpoint_dir: checkpoints/stage2_v3a
+    """
+    static_dim: int = 32         # 14 orig + 18 engineered price features
+    total_steps: int = 200_000   # extended from 120k
+    checkpoint_dir: str = "checkpoints/stage2_v3a"

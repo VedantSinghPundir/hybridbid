@@ -188,6 +188,35 @@ class Actor(nn.Module):
 
         return actor2
 
+    @classmethod
+    def init_stage2_from_stage1_new_obs(
+        cls, stage1_actor: "Actor", n_as_dims: int, new_obs_dim: int
+    ) -> "Actor":
+        """
+        Create a Stage 2 actor when obs_dim has changed (e.g. v3a: 90→108).
+
+        fc1 input dim differs from Stage 1 → cannot copy fc1 weights.
+        fc2, mode_head, energy heads: copied from Stage 1.
+        AS heads: near-zero init (same as init_stage2_from_stage1).
+        """
+        hidden_dim = stage1_actor.fc1.out_features
+        actor2 = cls(obs_dim=new_obs_dim, n_as_dims=n_as_dims, hidden_dim=hidden_dim)
+
+        # fc1: intentionally NOT copied — new input dim, fresh PyTorch default init
+        actor2.fc2.load_state_dict(stage1_actor.fc2.state_dict())
+        actor2.mode_head.load_state_dict(stage1_actor.mode_head.state_dict())
+        actor2.energy_mag_mean_head.load_state_dict(stage1_actor.energy_mag_mean_head.state_dict())
+        actor2.energy_mag_log_std_head.load_state_dict(stage1_actor.energy_mag_log_std_head.state_dict())
+
+        # AS heads: near-zero init
+        with torch.no_grad():
+            actor2.as_mag_mean_head.weight.normal_(0, 0.01)
+            actor2.as_mag_mean_head.bias.zero_()
+            actor2.as_mag_log_std_head.weight.normal_(0, 0.01)
+            actor2.as_mag_log_std_head.bias.zero_()
+
+        return actor2
+
 
 class Critic(nn.Module):
     """Single Q-network: Q(obs, action) -> scalar."""
