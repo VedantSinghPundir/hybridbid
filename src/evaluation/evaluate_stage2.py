@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.env.ercot_env import ERCOTBatteryEnv
 from src.models.sac import SACAgent
-from src.training.config import Stage1Config, Stage2Config
+from src.training.config import Stage1Config, Stage2Config, Stage2V3aConfig
 
 # Post-RTC+B baselines ($/day for 10 MW / 20 MWh battery)
 TBEX_DAILY_POST = 361.0
@@ -37,6 +37,7 @@ def evaluate(
     stage: int = 2,
     config=None,
     verbose: bool = True,
+    enriched_flat: bool = False,
 ) -> dict:
     """
     Run deterministic rollout on post-RTC+B test set.
@@ -70,6 +71,7 @@ def evaluate(
         battery_config=battery_config,
         seq_len=config.seq_len,
         date_range=(TEST_START, TEST_END),
+        enriched_flat=enriched_flat,
     )
     n_days = len(env.day_starts)
 
@@ -77,6 +79,7 @@ def evaluate(
         stage=stage,
         device=config.device,
         n_prices=config.n_prices,
+        n_prices_flat=getattr(config, "n_prices_flat", None),
         d_model=config.d_model,
         nhead=config.nhead,
         n_layers=config.n_layers,
@@ -207,9 +210,13 @@ if __name__ == "__main__":
         help="Evaluate Stage 1 v5.9 300k checkpoint on post-RTC+B test set",
     )
     parser.add_argument("--device", default=None)
+    parser.add_argument(
+        "--v3a", action="store_true",
+        help="Use Stage2V3aConfig (enriched flat obs, static_dim=32, obs_dim=108)",
+    )
     args = parser.parse_args()
 
-    cfg = Stage2Config()
+    cfg = Stage2V3aConfig() if args.v3a else Stage2Config()
     if args.device:
         cfg.device = args.device
 
@@ -218,4 +225,4 @@ if __name__ == "__main__":
         print(f"[Stage 1 baseline] Evaluating {s1_ckpt} on post-RTC+B test set")
         evaluate(s1_ckpt, stage=1, config=cfg)
     else:
-        evaluate(args.checkpoint, stage=2, config=cfg)
+        evaluate(args.checkpoint, stage=2, config=cfg, enriched_flat=args.v3a)
