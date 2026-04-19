@@ -86,6 +86,7 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
         battery_config=battery_config,
         seq_len=config.seq_len,
         date_range=(config.train_start, config.train_end),
+        enriched_obs=v60,
         enriched_flat=v3a,
     )
 
