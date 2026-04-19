@@ -19,7 +19,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.env.ercot_env import ERCOTBatteryEnv
 from src.models.sac import SACAgent
-from src.training.config import Stage1Config, Stage2Config, Stage2V3aConfig
+from src.training.config import Stage1Config, Stage2Config, Stage2V3aConfig, Stage2V60Config
 
 # Post-RTC+B baselines ($/day for 10 MW / 20 MWh battery)
 TBEX_DAILY_POST = 361.0
@@ -38,6 +38,7 @@ def evaluate(
     config=None,
     verbose: bool = True,
     enriched_flat: bool = False,
+    enriched_obs: bool = False,
 ) -> dict:
     """
     Run deterministic rollout on post-RTC+B test set.
@@ -72,6 +73,7 @@ def evaluate(
         seq_len=config.seq_len,
         date_range=(TEST_START, TEST_END),
         enriched_flat=enriched_flat,
+        enriched_obs=enriched_obs,
     )
     n_days = len(env.day_starts)
 
@@ -86,10 +88,8 @@ def evaluate(
         seq_len=config.seq_len,
         static_dim=config.static_dim,
         hidden_dim=config.hidden_dim,
-        tau_gumbel=0.1,  # fully annealed → deterministic
+        tau_gumbel=0.1,
     )
-    # weights_only_mode=True: skip optimizer states (may not match current config,
-    # e.g. Phase B checkpoints have partial ttfe_optimizer param groups)
     agent.load_checkpoint(checkpoint_path, weights_only_mode=True)
 
     if verbose:
@@ -107,8 +107,8 @@ def evaluate(
 
     for day_idx in range(n_days):
         obs, _ = env.reset(options={"day_idx": day_idx})
-        day_energy_pU = 0.0  # p.u. (needs ×P_max for actual $)
-        day_as_usd = 0.0     # already in actual $
+        day_energy_pU = 0.0
+        day_as_usd = 0.0
         day_modes = [0, 0, 0]
         day_violations = 0
         day_as_fracs = {p: [] for p in AS_PRODUCTS}
@@ -116,14 +116,11 @@ def evaluate(
 
         while not done:
             action = agent.select_action(obs, deterministic=True)
-            # Stage 1 agent outputs 4D; co_optimize env needs 9D — pad AS dims with zeros
             if stage == 1 and len(action) == 4:
                 action = np.concatenate([action, np.zeros(5, dtype=action.dtype)])
             obs, _, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
-            # energy_revenue is in p.u. (energy_mag * lmp * η * Δt); ×P_max = actual $
-            # as_revenue is already in actual $ (MW * $/MWh * Δt)
             day_energy_pU += info["energy_revenue"]
             day_as_usd += info["as_revenue"]
             day_modes[info["mode"]] += 1
@@ -209,14 +206,24 @@ if __name__ == "__main__":
         action="store_true",
         help="Evaluate Stage 1 v5.9 300k checkpoint on post-RTC+B test set",
     )
-    parser.add_argument("--device", default=None)
     parser.add_argument(
         "--v3a", action="store_true",
         help="Use Stage2V3aConfig (enriched flat obs, static_dim=32, obs_dim=108)",
     )
+    parser.add_argument(
+        "--v60", action="store_true", default=False,
+        help="Use Stage2V60Config (36-dim TTFE input, enriched obs)"
+    )
+    parser.add_argument("--device", default=None)
     args = parser.parse_args()
 
-    cfg = Stage2V3aConfig() if args.v3a else Stage2Config()
+    if args.v60:
+        cfg = Stage2V60Config()
+    elif args.v3a:
+        cfg = Stage2V3aConfig()
+    else:
+        cfg = Stage2Config()
+
     if args.device:
         cfg.device = args.device
 
@@ -225,4 +232,5 @@ if __name__ == "__main__":
         print(f"[Stage 1 baseline] Evaluating {s1_ckpt} on post-RTC+B test set")
         evaluate(s1_ckpt, stage=1, config=cfg)
     else:
-        evaluate(args.checkpoint, stage=2, config=cfg, enriched_flat=args.v3a)
+        evaluate(args.checkpoint, stage=2, config=cfg,
+                 enriched_flat=args.v3a, enriched_obs=args.v60)
