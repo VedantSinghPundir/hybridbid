@@ -19,7 +19,6 @@ Changes from v1:
   - Gumbel τ: 0.8→0.5 in Phase A, holds at 0.5 through Phase B (was 0.5→0.1 globally)
   - Total steps: 120k (was 150k; Phase C consumed 60k wasted steps)
 """
-
 import argparse
 import math
 import os
@@ -32,7 +31,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(__file__))))
 
 from src.env.ercot_env import ERCOTBatteryEnv
 from src.models.sac import SACAgent
-from src.training.config import Stage2Config, Stage2V3aConfig
+from src.training.config import Stage2Config, Stage2V3aConfig, Stage2V60Config
 
 # AS product names (matches env's projected_action[1:6] ordering)
 AS_PRODUCTS = ["regup", "regdn", "rrs", "ecrs", "nsrs"]
@@ -48,6 +47,7 @@ def train_stage2(config: Stage2Config = None, scratch: bool = False):
         config = Stage2Config()
 
     v3a = isinstance(config, Stage2V3aConfig)
+    v60 = isinstance(config, Stage2V60Config)
     if scratch:
         run_label = "stage2_scratch"
     elif v3a:
@@ -415,9 +415,19 @@ if __name__ == "__main__":
         help="Stage 2 v3a: enriched flat obs (18 price features, obs_dim=108). "
              "TTFE input stays 12-dim — loads perfectly from v5.9 300k."
     )
+    parser.add_argument(
+        "--v60", action="store_true", default=False,
+        help="Stage 2 compatible with Stage 1 v6.0 (36-dim TTFE input)."
+    )
     args = parser.parse_args()
 
-    config = Stage2V3aConfig() if args.v3a else Stage2Config()
+    if args.v60:
+        config = Stage2V60Config()
+    elif args.v3a:
+        config = Stage2V3aConfig()
+    else:
+        config = Stage2Config()
+
     if args.scratch:
         config.checkpoint_dir = "checkpoints/stage2_scratch"
     if args.steps is not None:
@@ -429,4 +439,4 @@ if __name__ == "__main__":
     if args.stage1_checkpoint is not None:
         config.stage1_checkpoint = args.stage1_checkpoint
 
-    train_stage2(config, scratch=args.scratch)
+    train_stage2(config, scratch=args.scratch) 
