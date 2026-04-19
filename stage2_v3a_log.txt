@@ -1,0 +1,25 @@
+nohup: ignoring input
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/stu5/s7/vp2364/hybridbid/src/training/train_stage2.py", line 432, in <module>
+    train_stage2(config, scratch=args.scratch)
+  File "/home/stu5/s7/vp2364/hybridbid/src/training/train_stage2.py", line 124, in train_stage2
+    agent.init_from_stage1(config.stage1_checkpoint)
+  File "/home/stu5/s7/vp2364/hybridbid/src/models/sac.py", line 421, in init_from_stage1
+    self.ttfe.load_state_dict(ckpt["ttfe"])
+  File "/home/stu5/s7/vp2364/miniforge3/envs/hybridbid/lib/python3.12/site-packages/torch/nn/modules/module.py", line 2639, in load_state_dict
+    raise RuntimeError(
+RuntimeError: Error(s) in loading state_dict for TTFE:
+	size mismatch for input_proj.weight: copying a param with shape torch.Size([64, 36]) from checkpoint, the shape in current model is torch.Size([64, 12]).
+=== Stage 2: Co-Optimization Fine-Tuning (stage2_v3a) ===
+Initialization:    Stage 1 v5.9 300k pretrained
+Data:              2025-12-05 → 2026-02-28
+Stage 1 ckpt:      checkpoints/stage1_v60/checkpoint_final.pt
+Device:            cuda
+Total steps:       200000
+Phase A (frozen):  0 → 79999
+Phase B (top-1):   80000 → 199999
+τ_gumbel:          0.8 → 0.5 (Phase A); holds at 0.5 (Phase B)
+target_entropy:    5.0 (corrected for 9D action space)
+Enriched flat obs: static_dim=32 (14 orig + 18 price features), obs_dim=108, TTFE input=12-dim (unchanged)

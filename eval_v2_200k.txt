@@ -1,0 +1,13 @@
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/stu5/s7/vp2364/hybridbid/src/evaluation/evaluate_stage2.py", line 221, in <module>
+    evaluate(args.checkpoint, stage=2, config=cfg)
+  File "/home/stu5/s7/vp2364/hybridbid/src/evaluation/evaluate_stage2.py", line 90, in evaluate
+    agent.load_checkpoint(checkpoint_path, weights_only_mode=True)
+  File "/home/stu5/s7/vp2364/hybridbid/src/models/sac.py", line 383, in load_checkpoint
+    self.actor.load_state_dict(ckpt["actor"])
+  File "/home/stu5/s7/vp2364/miniforge3/envs/hybridbid/lib/python3.12/site-packages/torch/nn/modules/module.py", line 2639, in load_state_dict
+    raise RuntimeError(
+RuntimeError: Error(s) in loading state_dict for Actor:
+	Missing key(s) in state_dict: "as_mag_mean_head.weight", "as_mag_mean_head.bias", "as_mag_log_std_head.weight", "as_mag_log_std_head.bias". 

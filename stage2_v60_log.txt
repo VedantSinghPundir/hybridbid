@@ -1,0 +1,6 @@
+nohup: ignoring input
+usage: train_stage2.py [-h] [--steps STEPS] [--device DEVICE]
+                       [--log-interval LOG_INTERVAL]
+                       [--stage1-checkpoint STAGE1_CHECKPOINT] [--scratch]
+                       [--v3a]
+train_stage2.py: error: unrecognized arguments: --v60

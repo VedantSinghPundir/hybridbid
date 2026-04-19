@@ -1,0 +1,28 @@
+
+=== Stage 1 Evaluation ===
+Checkpoint : checkpoints/stage1_v2/checkpoint_step300000.pt
+Test period: 2025-10-01 → 2025-12-04 (64 days)
+Device     : cuda
+
+───────────────────────────────────────────────────────
+  Daily Revenue (actual $)
+───────────────────────────────────────────────────────
+  Mean              $  114.38/day
+  Median            $   52.12/day
+  Std dev           $  160.76/day
+  Best day          $  692.17/day
+  Worst day         $ -323.86/day
+───────────────────────────────────────────────────────
+  Baselines
+    TBx rule-based  $  870.00/day   (vs agent: +13.1%)
+    Perfect foresight $1519.00/day
+    Capture rate         7.5%  of perfect foresight
+───────────────────────────────────────────────────────
+  Mode distribution (avg across days)
+    Charge            31.3%
+    Discharge         42.8%
+    Idle              25.9%
+  Avg SoC             7.27 MWh  (range: 2.0–18.0)
+  SoC violations    8
+───────────────────────────────────────────────────────
+
