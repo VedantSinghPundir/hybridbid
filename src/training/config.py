@@ -163,3 +163,18 @@ class Stage2V3aConfig(Stage2Config):
     static_dim: int = 32         # 14 orig + 18 engineered price features
     total_steps: int = 200_000   # extended from 120k
     checkpoint_dir: str = "checkpoints/stage2_v3a"
+
+
+@dataclass
+class Stage2V60Config(Stage2Config):
+    """Stage 2 compatible with Stage 1 v6.0 (36-dim TTFE input).
+    
+    Loads Stage 1 v6.0 checkpoint and fine-tunes on post-RTC+B data.
+    TTFE input stays 36-dim to match v6.0 weights.
+    """
+    n_prices: int = 36           # match Stage 1 v6.0 TTFE input
+    n_prices_flat: int = 12      # flat obs uses only original 12 dims
+    static_dim: int = 32         # 14 orig + 18 engineered price features
+    total_steps: int = 200_000
+    checkpoint_dir: str = "checkpoints/stage2_v60"
+    stage1_checkpoint: str = "checkpoints/stage1_v60/checkpoint_final.pt"
